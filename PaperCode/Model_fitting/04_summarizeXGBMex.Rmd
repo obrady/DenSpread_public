@@ -1,0 +1,1873 @@
+---
+title: "Summarize XGBoost in Mexico"
+author: "Vinyas Harish"
+date: "12/04/2021"
+output: html_document
+---
+
+Setup workspace\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~
+
+```{r, Load in libraries, functions, data and do pre-processing}
+knitr::opts_chunk$set(echo = TRUE)
+#Basic loadins ####
+rm(list = ls())
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(RColorBrewer)
+library(tidymodels)
+library(plotly)
+library(probably)
+library(vip)
+library(forcats)
+library(tidyr)
+library(tmap)
+library(patchwork)
+
+source("Fx_maximizeJIndex.R")
+source("Fx_minimizeClassificationDist.R")
+source("Fx_computePerformanceMetrics.R")
+source("Fx_tidyRegionalMetricsMex.R")
+source("Fx_tidyYearlyMetricsMex.R")
+source("Fx_timeseriesCV_short.R")
+source("Fx_timeseriesCV_mediumMex.R")
+source("Fx_suitAssemble.R")
+source("Fx_addCovariatesMex.R")
+source("Fx_createChannelPlotDataframes.R")
+source("Fx_predictIncidence.R")
+source("Fx_computePerformanceMetricsNonIncidenceBasedThresholding.R")
+
+bg <- c("all", "reporting")
+bg <- "all"
+
+# working directory
+#setwd("/Users/Vinyas/OneDrive/08_Serotype_spread/")
+setwd("/Users/eideobra/Dropbox/08_Serotype_spread/")
+
+# load location data
+load("Data/Intermediate_datasets/Mexico_location_data.RData")
+
+# and shapefiles 
+#admin1 <- st_read("/Users/Vinyas/OneDrive/08_Serotype_spread/Reference/MEX_shapefiles/mex_admbnda_adm1_govmex_20200618.shp")
+#admin2 <- st_read("/Users/Vinyas/OneDrive/08_Serotype_spread/Reference/MEX_shapefiles/mex_admbnda_adm2_govmex_20200618.shp")
+admin1 <- st_read("/Users/eideobra/Dropbox/08_Serotype_spread/Reference/MEX_shapefiles/mex_admbnda_adm1_govmex_20200618.shp")
+admin2 <- st_read("/Users/eideobra/Dropbox/08_Serotype_spread/Reference/MEX_shapefiles/mex_admbnda_adm2_govmex_20200618.shp")
+
+admin2 <- admin2 %>% rename(GAUL_CODE = ADM2_PCODE)
+admin2$GAUL_CODE <- stringr::str_replace_all(admin2$GAUL_CODE, "MX", "")
+admin2$GAUL_CODE <- stringr::str_remove(admin2$GAUL_CODE,"^0+")
+
+#Load in fitting datasets
+load(file = "Data/Intermediate_datasets/Retrospective_pred/Spread_datasets_Mexico.RData")
+
+#Go from list into long dataframe but do not recode 
+spread_dat = bind_rows(spread_dat)
+spread_dat$Infected <- as.factor(spread_dat$Infected)
+
+# Augment spread_dat with new variables ####
+## Augmentation 1 -> Add in region for each GAUl obs ####
+### Create a lookup table from states -> regions
+regions_states_LUT = data.frame(stringsAsFactors = FALSE, 
+                                State=c("Aguascalientes","Baja California", "Baja California Sur", "Campeche","Chiapas","Chihuahua",
+                                        "Coahuila de Zaragoza","Colima","Distrito Federal","Durango","Guanajuato","Guerrero","Hidalgo",
+                                        "Jalisco","México","Michoacán de Ocampo","Morelos","Nayarit","Nuevo León","Oaxaca",
+                                        "Puebla","Querétaro de Arteaga","Quintana Roo","San Luis Potosí","Sinaloa","Sonora","Tabasco",
+                                        "Tamaulipas","Tlaxcala","Veracruz de Ignacio de la Llave","Yucatán","Zacatecas"),
+                                Region = c("West","Northwest", "Northwest","Southeast","South","Northeast",
+                                           "Northeast","West","Central","Northeast","West","South","Central",
+                                           "West","Central","West","Central","West","Northeast","South",
+                                           "Central","West","Southeast","Northeast","Northwest","Northwest","Southeast",
+                                           "Northeast","Central","South","Southeast","Northeast"))
+getRegion <- regions_states_LUT$Region
+names(getRegion) <- regions_states_LUT$State
+# aguascalientesRegion <- unname(getRegion["Aguascalientes"]) returns "West"
+
+### Add region column to admin1 df
+admin1$REGION <- NA
+admin1 <- admin1 %>% mutate(REGION=getRegion[ADM1_ES])
+
+### Add region column to spreaddat, note we can skip a step compared to Brazil since we have the state for each region already 
+spread_dat$Region <- ""
+spread_dat$Region <- apply(spread_dat, 1, function(row) {
+  municipality_GAUL <- row["GAUL"]
+  admin2_index <- match(municipality_GAUL, admin2$GAUL_CODE)
+  state_name <- admin2[admin2_index,]$ADM1_ES
+  region_name <- unname(getRegion[state_name])
+  return(region_name)
+})
+spread_dat$Region <- as.factor(spread_dat$Region)
+
+## Augmentation 2 -> Add latitude and longitude for each GAUL obs ####
+merged_data <- base::merge(spread_dat, location_data, by.x = "GAUL", by.y="location")
+
+# Replace the x and y columns in spread_dat with the x and y columns from location_data
+spread_dat$x <- as.numeric(merged_data$x)
+spread_dat$y <- as.numeric(merged_data$y)
+
+#Clean workspace for unnecessary variables
+rm(merged_data)
+
+##Augmentation 3 -> Denote eligibility for test sets for each GAUL obs ####
+#Get initial conditions from  dat starting in 1996
+#dat <- read.csv("/Users/Vinyas/OneDrive/08_Serotype_spread/Data/Mexico_mun_dat_cleaned_thresholded.csv")
+dat <- read.csv("/Users/eideobra/Dropbox/08_Serotype_spread/Data/Mexico_mun_dat_cleaned_thresholded.csv")
+yearOfInitialConditions <- min(dat$year)
+initialConditions <- dat %>% dplyr::filter(Year == yearOfInitialConditions) %>% dplyr::select(GAUL_CODE)
+
+#Update spread_dat year by year 
+yearlist <- (yearOfInitialConditions+2):2019
+dataByYear <- list()
+
+#This is a sort of basecase (first year of spread_dat)
+firstYearOfSpreaddat <-  spread_dat %>% dplyr::filter(Year_end==(yearOfInitialConditions+1)) %>% 
+                                        mutate(TestElig = case_when(GAUL %in% initialConditions$GAUL ~ 0,
+                                                                    TRUE ~ 1))
+dataByYear[[1]] <- firstYearOfSpreaddat
+
+#Add in newly invaded regions in other years
+for (year in yearlist){
+infectedLastYear <- spread_dat %>% dplyr::filter(Year_end==(year-1) & Infected==1) %>% dplyr::select(GAUL)
+infectedThisYear <- spread_dat %>% dplyr::filter(Year_end==year & Infected==1) %>% dplyr::select(GAUL)
+newlyInfectedRegions <- dplyr::setdiff(infectedThisYear, infectedLastYear) 
+
+#If a region is not infected yet and is not part of the initial conditions, it is eligible for the test set 
+#If a region is reported as infected, its only eligible if it wasn't infected in the previous year
+newlyInfectedThisYear <- spread_dat %>% dplyr::filter(Year_end==year) %>% 
+                                        mutate(TestElig = case_when(Infected == 0 ~ 1,
+                                                                    Infected == 1 & GAUL %in% newlyInfectedRegions$GAUL ~ 1,
+                                                                    Infected == 1 & !(GAUL %in% newlyInfectedRegions$GAUL) ~ 0))
+
+#Start filling at row 2
+listIndex = year-yearOfInitialConditions
+dataByYear[[listIndex]] <- newlyInfectedThisYear
+}
+spread_dat <- bind_rows(dataByYear)
+
+#Clean workspace for unnecessary variables
+rm(infectedLastYear,infectedThisYear,newlyInfectedRegions,newlyInfectedThisYear,yearlist,dataByYear,firstYearOfSpreaddat,listIndex)
+```
+
+```{r, Tune XGB - Last ran Dec 27 2023}
+#Only run when there are updates to the dataset...
+  # Note - This version is using the "MAX" version of spread_dat and addCovariates
+set.seed(202212)
+
+train_test_split <- initial_split(spread_dat,prop = 3/4, strata=Infected)
+trainset_XGB <- training(train_test_split)
+testset_XGB <- testing(train_test_split)
+testset_XGB <- testset_XGB %>% dplyr::filter(TestElig==1)
+
+folds <- vfold_cv(trainset_XGB, v=5)
+  
+#Create recipe where you exclude variables you do not want as predictors but keep in the dataset
+xgb_rec <- recipe(Infected ~ ., data = trainset_XGB) %>%
+             update_role(ae_suit, y, TCW_mean, LOGimport_pres_Grav,LOGimport_pres_GC,
+                          Year_end,GAUL, TestElig, Region, new_role = "ID") %>% 
+             step_normalize(x,LST_day_mean,LST_day_stdDev,LST_night_mean,LST_night_stdDev,TCW_stdDev,
+                             EVI_mean,EVI_stdDev,Landcover,TCB_mean,TCB_stdDev,
+                             LOGimport_pres_Fric,LOGimport_pres_Rad,import_pres_Adjacency, LOGimport_pres_Air,LOGimport_pres_Mig) 
+  
+#Specify an XGBoost model
+xgb_spec_tuning <- boost_tree(min_n=tune(), 
+                              tree_depth=tune(), 
+                              learn_rate=tune(), 
+                              loss_reduction=tune(), 
+                              trees=tune(), 
+                              mtry=tune(),
+                              sample_size = tune(),
+                              stop_iter = tune()) %>%
+                   set_engine("xgboost") %>% 
+                   set_mode("classification")
+  
+#Workflows combine model specifications and dataset recipes
+xgb_tuning_wflow <- workflow() %>% 
+                    add_recipe(xgb_rec) 
+  
+#Define the grid of hyperparameters and tune
+xgboost_params <- parameters(min_n(),
+                             tree_depth(),
+                             learn_rate(),
+                             loss_reduction(),
+                             trees(),
+                             stop_iter(),
+                             finalize(mtry(c(1,16))),
+                             sample_size = sample_prop(c(0.75, 0.99)))
+  
+xgboost_grid <- grid_max_entropy(xgboost_params, 
+                                 size = 500)
+  
+doParallel::registerDoParallel()
+  
+tuningResults <- tune_grid(xgb_tuning_wflow %>% add_model(xgb_spec_tuning),
+                           resamples = folds,
+                           grid = xgboost_grid,
+                           metrics = metric_set(roc_auc, bal_accuracy, j_index),
+                           control = control_grid(verbose = TRUE, event_level = "second"))
+  
+#Updated workflow with tuned hyperparameters and check performance
+xgb_highest_auc <- tuningResults %>% select_best("roc_auc")
+xgb_highest_j <- tuningResults %>% select_best("j_index")
+
+if(isTRUE(identical(xgb_highest_auc, xgb_highest_j))){
+  print("Grid search found that the same set of hyperparameters could optimize for both max AUC and J-Index in the search space.")
+}else{
+  print(identical(xgb_highest_auc, xgb_highest_j))
+}
+
+xgb_tuned_wflow <- finalize_workflow(xgb_tuning_wflow %>% 
+                                     add_model(xgb_spec_tuning),
+                                     xgb_highest_auc) %>%
+                   fit(data = trainset_XGB)
+  
+thresholdRange <- seq(0, 0.99, by = 0.01)
+probThres <- minimizeClassificationDist(xgb_tuned_wflow, testset_XGB, thresholdRange)
+  
+#AUC/SP/SN overall, regionally, and yearly
+metrics_xgb_Overall <- computePerformanceMetrics_NonIncidenceBasedThresholding(xgb_tuned_wflow, testset_XGB, probThres)
+
+# runtime = ~ 5 hours
+```
+
+```{r, Finetune XGB - Last ran Jan 16 2022}
+library(finetune)
+set.seed(202212)
+
+# Notes: 
+  # Text - https://www.tmwr.org/iterative-search.html#tune-sim-anneal 
+  # Documentation - https://finetune.tidymodels.org/reference/tune_sim_anneal.html  
+
+ctrl_sa <- control_sim_anneal(verbose = TRUE, no_improve = 10L)
+
+xgb_sa <- xgb_tuning_wflow %>% add_model(xgb_spec_tuning) %>% 
+                               tune_sim_anneal(resamples = folds,
+                                               metrics = metric_set(j_index),
+                                               initial = tuningResults,
+                                               param_info = xgboost_params,
+                                               iter = 50,
+                                               control = ctrl_sa)
+```
+
+```{r, Specify XGB parameters}
+set.seed(202212)
+#Create recipe where you exclude variables you do not want as predictors but keep in the dataset
+xgb_rec <- recipe(Infected ~ ., data = spread_dat) %>%
+           update_role(ae_suit, y, TCW_mean, LOGimport_pres_Grav,LOGimport_pres_GC,
+                       Year_end,GAUL, TestElig, Region, new_role = "ID") %>% 
+           step_normalize(x,LST_day_mean,LST_day_stdDev,LST_night_mean,LST_night_stdDev,TCW_stdDev,
+                          EVI_mean,EVI_stdDev,Landcover,TCB_mean,TCB_stdDev,
+                          LOGimport_pres_Fric,LOGimport_pres_Rad,import_pres_Adjacency, LOGimport_pres_Air,LOGimport_pres_Mig) 
+
+#Specify an XGBoost model with previously tuned hyperparameters (as of Dec 27, 2023)
+# unlist(xgb_highest_auc)
+xgb_spec_pretuned <- boost_tree(mtry = 8,
+                                min_n = 4, 
+                                tree_depth = 14, 
+                                learn_rate = 0.0465329617238014, 
+                                loss_reduction = 6.31199815658604e-10, 
+                                trees = 1623,
+                                sample_size = 0.778234192449599,
+                                stop_iter = 15) %>%
+                     set_engine("xgboost") %>% 
+                     set_mode("classification")
+
+#Workflows combine model specifications and dataset recipes
+xgb_pretuned_wflow <- workflow() %>% 
+                      add_recipe(xgb_rec) %>% 
+                      add_model(xgb_spec_pretuned)
+```
+
+Shapley Value-Based Feature Importance \~\~\~\~\~\~\~\~\~\~\~\~\~
+
+```{r, Generate SHAP summary plot}
+set.seed(202212)
+library(SHAPforxgboost)
+#Following the approach of: https://github.com/liuyanguu/SHAPforxgboost
+#Since using the base XGB, pull out the XMat and YCol
+xgb_X <- spread_dat %>% dplyr::select(-c(Infected, ae_suit, TCW_mean, LOGimport_pres_Grav,LOGimport_pres_GC,Year_end, Region, GAUL, y, TestElig)) %>%
+                        dplyr::rename("Mean nighttime temp."="LST_night_mean",
+                                      "Radiation"="LOGimport_pres_Rad",
+                                      "Air travel"="LOGimport_pres_Air",
+                                      "Migration"="LOGimport_pres_Mig",
+                                      "Std dev daytime temp. "="LST_day_stdDev",
+                                      "Mean env. veg. index"="EVI_mean",
+                                      "Mean tassled cap brightness"="TCB_mean",
+                                      "Mean daytime temp."="LST_day_mean",
+                                      "Friction surface"="LOGimport_pres_Fric",
+                                      "Std dev tassled cap brightness"="TCB_stdDev",
+                                      "Std dev nighttime temp."="LST_night_stdDev",
+                                      "Std dev env. veg. index"="EVI_stdDev",
+                                      "Std dev tassled cap wetness"="TCW_stdDev",
+                                      "Longitude"="x",
+                                      "Adjacency"="import_pres_Adjacency")
+xgb_y <- spread_dat %>% dplyr::select(Infected)
+
+xgb_X <- as.matrix(xgb_X)
+xgb_X <- scale(xgb_X, center = TRUE, scale = TRUE)
+xgb_y <- as.matrix(xgb_y)
+
+params <-list(objective = "binary:logistic",
+              colsample_bynode = 0.5, #mtry (8/16=0.5)
+              eta = 0.04653296, #learn_rate
+              max_depth = 14, #tree_depth
+              gamma = 6.311998e-10, #loss_reduction
+              subsample = 0.7782342, #sample_size
+              min_child_weight = 4) #min_n
+              
+mod <- xgboost::xgboost(data = xgb_X, label = xgb_y, 
+                        params = params, 
+                        nrounds = 1623, #trees
+                        early_stopping_rounds = 15, #stop_iter
+                        verbose = FALSE)
+
+# To return the SHAP values and ranked features by mean|SHAP|
+shap_values <- shap.values(xgb_model = mod, X_train = xgb_X)
+
+# To prepare the long-format data:
+shap_long <- shap.prep(xgb_model = mod, X_train = xgb_X)
+
+# Create summary plot
+label.feature <- function(x){
+  # a saved list of some feature names that I am using
+  labs <- SHAPforxgboost::labels_within_package
+  # but if you supply your own `new_labels`, it will print your feature names
+  # must provide a list.
+  if (!is.null(new_labels)) {
+    if(!is.list(new_labels)) {
+      message("new_labels should be a list, for example,`list(var0 = 'VariableA')`.\n")
+      }  else {
+      message("Plot will use your user-defined labels.\n")
+      labs = new_labels
+      }
+  }
+  out <- rep(NA, length(x))
+  for (i in 1:length(x)){
+    if (is.null(labs[[ x[i] ]])){
+      out[i] <- x[i]
+    }else{
+      out[i] <- labs[[ x[i] ]]
+    }
+  }
+  return(out)
+}
+
+shap.plot.summary <- function(data_long, x_bound = NULL, dilute = FALSE, scientific = FALSE, my_format = NULL,
+                              min_color_bound = "#FFCC33", max_color_bound = "#6600CC"){
+
+  if (scientific){label_format = "%.1e"} else {label_format = "%.3f"}
+  if (!is.null(my_format)) label_format <- my_format
+  # check number of observations
+  N_features <- data.table::setDT(data_long)[,data.table::uniqueN(variable)]
+  if (is.null(dilute)) dilute = FALSE
+
+  nrow_X <- nrow(data_long)/N_features # n per feature
+  if (dilute!=0){
+    # if nrow_X <= 10, no dilute happens
+    dilute <- ceiling(min(nrow_X/10, abs(as.numeric(dilute)))) # not allowed to dilute to fewer than 10 obs/feature
+    set.seed(1234)
+    data_long <- data_long[sample(nrow(data_long),
+                                  min(nrow(data_long)/dilute, nrow(data_long)/2))] # dilute
+  }
+
+  x_bound <- if (is.null(x_bound)) max(abs(data_long$value))*1.1 else as.numeric(abs(x_bound))
+  plot1 <- ggplot(data = data_long) +
+    coord_flip(ylim = c(-x_bound, x_bound)) +
+    geom_hline(yintercept = 0) + # the y-axis beneath
+    # sina plot:
+    ggforce::geom_sina(aes(x = variable, y = value, color = stdfvalue),
+              method = "counts", maxwidth = 0.7, alpha = 0.7) +
+    scale_color_gradient(low=min_color_bound, high=max_color_bound,
+                         breaks=c(0,1), labels=c(" Low", "High "),
+                         guide = guide_colorbar(barwidth = 12, barheight = 0.3)) +
+    theme_bw() +
+    theme(axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(), # remove axis line
+          legend.position="bottom",
+          legend.title=element_text(size=10),
+          legend.text=element_text(size=8),
+          axis.title.x= element_text(size = 10)) +
+    # reverse the order of features, from high to low
+    # also relabel the feature using `label.feature`
+    scale_x_discrete(limits = rev(levels(data_long$variable)),
+                     labels = label.feature(rev(levels(data_long$variable))))+
+    labs(y = "SHAP value (impact on model output)", x = "", color = "Feature value  ")
+  return(plot1)
+}
+
+shap.plot.summary(shap_long)
+```
+
+```{r, Map the driving feature set within the contemporary data}
+shapByGAUL <- shap_values$shap_score
+shapByGAUL <- cbind(shapByGAUL, xgb_y, spread_dat$Year_end, spread_dat$TestElig, spread_dat$GAUL) %>% 
+              rename("Year_end"="V3",
+                     "TestElig"="V4",
+                     "GAUL"="V5")
+shapByInvadedGAUL <- shapByGAUL %>% dplyr::filter(xgb_y == 1) %>%
+                                    dplyr::filter(TestElig ==1) %>% 
+                                    mutate(Env_Shap = `Mean env. veg. index` + 
+                                                      `Std dev env. veg. index` +
+                                                       Landcover +
+                                                       `Mean daytime temp.`+
+                                                       `Std dev daytime temp. `+
+                                                      `Mean nighttime temp.`+
+                                                      `Std dev nighttime temp.`+
+                                                      `Mean tassled cap brightness`+
+                                                      `Std dev tassled cap brightness`+
+                                                      `Std dev tassled cap wetness`+
+                                                      Longitude) %>%
+                                    mutate(Mob_Shap = Radiation+
+                                                      Adjacency+
+                                                      `Air travel`+
+                                                      Migration+
+                                                      `Friction surface`) %>%
+                                    mutate(Driver_Shap = case_when(Env_Shap > Mob_Shap ~ "Env",
+                                                                   Mob_Shap > Env_Shap ~ "Mob",
+                                                                   Mob_Shap == Env_Shap ~ "Tie"))
+
+#What's the ratio of driver shaps?
+  # Note - Only sums to 1334 (since 16 were infected as the initial conditions)
+  # Env =  767 / 1334 = 0.5749625
+  # Mob =  567 / 1334 = 0.4250375
+table(shapByInvadedGAUL$Driver_Shap)
+
+# Get GAUL codes 
+shapByInvadedGAULSpatial <- sp::merge(admin2, shapByInvadedGAUL, by.x="GAUL_CODE", by.y="GAUL", all.x=TRUE)
+
+tm_shape(shapByInvadedGAULSpatial) +
+tm_polygons(border.col = "black")+
+tm_shape(shapByInvadedGAULSpatial) +
+tm_fill("Driver_Shap") +
+tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.fontface = "bold")
+
+```
+
+```{r, Plot of driving features over time from contemporary data}
+# summarise proportion of invasions for each year that are due to environmental or mobility covariates
+timeShap <- table(shapByInvadedGAUL$Driver_Shap, shapByInvadedGAUL$Year_end)
+# convert to proportions
+timeShap <- apply(timeShap, 2, function(x) c(x[1] / sum(x),
+                                             x[2] / sum(x)))
+# reshape to long format
+timeShap <- data.frame(Subject = rownames(timeShap),
+                       timeShap)
+timeShap <- reshape(timeShap, idvar = "Subject", varying = list(2:22), v.names = "X", direction = "long")
+# fix years
+timeShap$time = timeShap$time - 1 + min(shapByInvadedGAUL$Year_end)
+
+
+# plotting code
+ggplot(timeShap, aes(fill=Subject, y=X, x=time)) + 
+    geom_bar(position="fill", stat="identity") +
+  scale_fill_manual(values=c(rgb(149/255, 211/255, 199/255), rgb(254/255, 253/255, 174/255))) +
+  xlab("Year") +
+  ylab("Proportion of invaded municipalities")
+
+```
+
+Time-series CV n-TSCV: \~\~\~\~\~\~\~\~\~\~\~\~\~\~
+
+```{r, Run naive validation}
+source("Fx_naiveTSCV.R")
+
+seedList = c(1234, 2345, 3456, 4567, 5678, 6789, 7890, 8901, 9012, 10123)
+
+naive_metricsList <- c()
+naive_predictionsList <- c() 
+naive_metricsList_Regional <- c()
+naive_metricsList_Yearly <- c()
+
+thresholds_nTSCV <- predictIncidence(Years = 1997:2019, Country = "Mexico", Current_year = 2020, 
+                                     mod_sample = FALSE, mod_mode = "CV")
+thresholds_nTSCV <- thresholds_nTSCV[, "Incid"]
+
+startTime <- Sys.time()
+
+for (runIndex in 1:10){
+  outputs_nTSCV <- naiveTSCV(spread_dat, xgb_pretuned_wflow, randomSeed=seedList[runIndex], country="Mexico", thresholds=thresholds_nTSCV) 
+  metrics_nTSCV <- outputs_nTSCV[[1]]
+  predictions_nTSCV <- outputs_nTSCV[[2]] %>% dplyr::select(GAUL, Year, .pred_class) %>%
+                                              rename(Prediction = .pred_class) %>%
+                                              mutate(Seed = seedList[runIndex])
+  metrics_nTSCV_Regional <- outputs_nTSCV[[3]]
+  metrics_nTSCV_Yearly <- outputs_nTSCV[[4]]
+  
+  naive_metricsList[[runIndex]] <- metrics_nTSCV
+  naive_predictionsList[[runIndex]] <- predictions_nTSCV
+  naive_metricsList_Regional[[runIndex]] <- metrics_nTSCV_Regional
+  naive_metricsList_Yearly[[runIndex]] <- metrics_nTSCV_Yearly
+}
+
+Sys.time() - startTime
+#Takes 15-30 min with 10 random seeds
+```
+
+```{r, Plot naive validation}
+#Clean up overall data for plotting 
+naive_metrics_Overall <- data.frame(matrix(ncol=3,nrow=30, dimnames=list(NULL, c("Run", "Metric", "Value"))))
+
+a <- purrr::flatten(naive_metricsList)
+b <- a[seq(3, length(a), 3)]
+c <- as.matrix(purrr::flatten(b))
+
+naive_metrics_Overall$Value <- c 
+naive_metrics_Overall$Run <- rep(c(1,2,3,4,5,6,7,8,9,10), each=3)
+naive_metrics_Overall$Metric <- rep(c("SN","SP","AUC"), each=1) 
+
+naive_metrics_Overall %>% unnest(cols = c(Value)) %>%
+                          ggplot(aes(x = Metric, y = Value, fill= Metric)) + 
+                          geom_boxplot() + theme_bw() +
+                          theme(axis.title.x = element_text( face = "bold"),
+                                axis.title.y = element_text( face = "bold"),
+                                legend.position = "none")+
+                          scale_fill_manual(values=c("#FF765A", "#9DB98A", "#7FA3C2"))
+
+# Clean up regional data for plotting 
+  ## nrow = n metrics x n regions x n seeds
+  ##      = 3 x 6 x 10
+naive_metrics_Regional <- data.frame(matrix(ncol=4,nrow=180, dimnames=list(NULL, c("Run", "Region", "Metric", "Value"))))
+
+d <- as.matrix(purrr::flatten(naive_metricsList_Regional))
+e <- d[-seq(1, length(d), 4)]
+f <- as.matrix(purrr::flatten(e))
+
+naive_metrics_Regional$Value <- f 
+naive_metrics_Regional$Run <- rep(c(1,2,3,4,5,6,7,8,9,10), each=18)
+naive_metrics_Regional$Metric <- c(rep(c("AUC"), each=6),
+                                   rep(c("SN"), each=6),
+                                   rep(c("SP"),each=6))
+naive_metrics_Regional$Region <- rep(c("C","NE","NW", "S", "SE", "W"), each=1)
+
+naive_metrics_Regional %>% unnest(cols = c(Value)) %>%
+                           ggplot(aes(x = Region, y = Value, fill=Region)) + 
+                           geom_boxplot() +
+                           facet_wrap(~Metric, scales="free") + theme_bw() +
+                           theme(axis.title.x = element_text( face = "bold"),
+                                 axis.title.y = element_text( face = "bold"))+
+                           scale_fill_brewer(palette="BrBG")
+
+# Clean up yearly data for plotting 
+  ## nrow = n metrics x n years x n seeds
+  ##      = 3 x 23 x 10
+naive_metrics_Yearly <- data.frame(matrix(ncol=4,nrow=690, dimnames=list(NULL, c("Run", "Year", "Metric", "Value"))))
+
+g <- as.matrix(purrr::flatten(naive_metricsList_Yearly))
+h <- g[-seq(1, length(g), 4)]
+i <- as.matrix(purrr::flatten(h))
+
+naive_metrics_Yearly$Value <- i 
+naive_metrics_Yearly$Run <- rep(c(1,2,3,4,5,6,7,8,9,10), each=69)
+naive_metrics_Yearly$Metric <- c(rep(c("AUC"), each=23),
+                                   rep(c("SN"), each=23),
+                                   rep(c("SP"),each=23))
+naive_metrics_Yearly$Year <- rep(c("'97","'98","'99","'00",
+                                   "'01","'02","'03","'04", "'05", "'06", "'07",
+                                   "'08","'09","'10", "'11", "'12", "'13",
+                                   "'14","'15","'16", "'17", "'18", "'19"), each=1)
+
+naive_metrics_Yearly %>% unnest(cols = c(Value)) %>%
+                          ggplot(aes(x = Year, y = Value, fill=Metric)) + 
+                          geom_boxplot() +
+                          facet_wrap(~Metric, scales="free", nrow=3) + 
+                          theme_bw()+
+                          theme(axis.title.x = element_text( face = "bold"),
+                                axis.title.y = element_text( face = "bold"),
+                                legend.position = "none")+
+                          scale_fill_manual(values=c("#FF765A", "#9DB98A", "#7FA3C2"))
+
+```
+
+```{r, Create dataframe of residuals}
+########################################################
+# Obtain ground truths on when GAULs became infected ###
+########################################################
+start_year <- 1996
+gtYearInfected <- spread_dat %>% dplyr::filter(Year_end == 1997) %>% 
+                                 dplyr::filter(GAUL %in% initialConditions$GAUL_CODE) %>% 
+                                 dplyr::select(GAUL) %>% 
+                                 mutate(YearInfected = start_year)  
+#Figure out which GAULs are newly infected each year
+for (yearIndex in (1:23)){
+  if (yearIndex == 1){
+    infectedPriorYear <- gtYearInfected %>% dplyr::select(GAUL)
+    infectedThisYear <- spread_dat %>% dplyr::filter(Year_end==(start_year+yearIndex) & Infected == 1) %>% dplyr::select(GAUL)
+  }else{
+    infectedPriorYear <- spread_dat %>% dplyr::filter(Year_end==(start_year+yearIndex-1) & Infected == 1) %>% dplyr::select(GAUL) 
+    infectedThisYear <- spread_dat %>% dplyr::filter(Year_end==(start_year+yearIndex) & Infected == 1) %>% dplyr::select(GAUL)
+  }
+  
+  newlyInfectedGAULs <- dplyr::setdiff(infectedThisYear, infectedPriorYear) %>% mutate(YearInfected = (start_year+yearIndex))
+  
+  #Assignment
+  gtYearInfected <- rbind(gtYearInfected, newlyInfectedGAULs)
+}
+
+
+#Add in the GAULs that never become infected as NA
+neverInfectedGAULS <- spread_dat %>% dplyr::filter(Year_end==2019) %>% dplyr::filter(Infected==0) %>% dplyr::select(GAUL) %>% mutate(YearInfected = NA)
+gtYearInfected <- rbind(gtYearInfected, neverInfectedGAULS)
+
+############################################################
+# Obtain model predictions on when GAULs became infected ###
+############################################################
+predictions_nTSCV <- bind_rows(naive_predictionsList) %>% group_by(GAUL) %>% 
+                                                          dplyr::filter(Prediction==1) %>% 
+                                                          dplyr::filter(Year == min(Year)) %>%
+                                                          mutate(MedianYearOverSeeds = median(Year)) %>% 
+                                                          dplyr::slice(1) %>% 
+                                                          rename(YearPredicted=MedianYearOverSeeds) %>% 
+                                                          dplyr::select(GAUL, YearPredicted)
+
+#Left join to get all GAULs in ground truth
+joined_nTSCV <- merge(x=gtYearInfected, y=predictions_nTSCV, by="GAUL", all.y=T)
+
+joined_nTSCV <- joined_nTSCV %>% mutate(Residual = YearInfected - YearPredicted) %>% 
+                                 mutate(Residual = case_when((is.na(YearInfected) & is.na(YearPredicted)) ~ 0,
+                                                             (!is.na(YearInfected) & is.na(YearPredicted)) ~ -20,
+                                                             (is.na(YearInfected) & !is.na(YearPredicted)) ~ 20,
+                                                             TRUE ~ as.numeric(Residual)))
+
+joinedBinned_nTSCV <- joined_nTSCV %>% mutate(Residual = case_when(Residual > 4 ~ 5,
+                                                                   Residual < -4 ~ -5,
+                                                                   TRUE ~ as.numeric(Residual)))
+
+#Add region to each GAUL 
+joinedBinned_nTSCV$Region = ""
+for(i in 1:nrow(joinedBinned_nTSCV)){
+  municipality_GAUL <- joinedBinned_nTSCV$GAUL[i]
+  admin2_index <- match(municipality_GAUL, admin2$GAUL_CODE)
+  state_name <- admin2[admin2_index,]$ADM1_ES
+  region_name <- unname(getRegion[state_name])
+  joinedBinned_nTSCV$Region[i] <- region_name
+}
+
+joinedBinned_nTSCVNoIniCon <- joinedBinned_nTSCV %>% dplyr::filter(!(GAUL %in% initialConditions$GAUL_CODE))
+
+joinedBinnedSpatial_nTSCV <- merge(admin2, joinedBinned_nTSCV, by.x="GAUL_CODE", by.y="GAUL")
+
+```
+
+```{r, Plot residuals as a bargraph }
+joinedBinned_nTSCV %>% ggplot(aes(x=Residual, fill=as.factor(Residual))) + 
+                 geom_bar(stat="count", colour="black")+theme_bw() +
+                 theme(axis.title.x = element_text( face = "bold"),
+                       axis.title.y = element_text( face = "bold"),
+                       legend.position = "none")+
+                 ylab("Number of municipalities with value")+
+                 scale_fill_brewer(palette="PuOr")
+```
+
+```{r, Plot residuals as calibration curve}
+x <- c(1997:2019)
+y <- c(1997:2019)
+perfectCal <- data.frame(x,y)
+
+joinedBinned_nTSCVNoIniCon %>% dplyr::filter(!is.na(YearInfected) & !is.na(YearPredicted)) %>%
+                               ggplot(aes(x=as.factor(YearPredicted), y=YearInfected))+
+                                      geom_boxplot()+theme_bw()+ggtitle("Calibration - nTSCV Mexico")+
+                                      xlab("Year Predicted") + ylab("Year Infected")+
+                                      geom_line(data=perfectCal, aes(x=as.factor(x), y=y, group = 1), color="red")+ 
+                                      geom_point(data=perfectCal, aes(x=as.factor(x), y=y, group = 1), color="red")+ 
+                                      scale_x_discrete(breaks=seq(1997,2019,2)) +                                   
+                                      scale_y_continuous(breaks=seq(1997,2019,2))
+
+nTSCV_CalPlot_xRug1  <- joinedBinned_nTSCVNoIniCon %>% dplyr::filter(is.na(YearInfected) & !is.na(YearPredicted)) %>%
+                                                       group_by(YearPredicted) %>%
+                                                       tally() %>%
+                                                       mutate(InfectionType="Never infected")
+
+nTSCV_CalPlot_xRug2  <- joinedBinned_nTSCVNoIniCon %>% dplyr::filter(!is.na(YearInfected) & !is.na(YearPredicted)) %>%
+                                                       group_by(YearPredicted) %>%
+                                                       tally() %>%
+                                                       mutate(InfectionType="Infected")
+
+nTSCV_CalPlot_xRug <- rbind(nTSCV_CalPlot_xRug1, nTSCV_CalPlot_xRug2) 
+nTSCV_CalPlot_xRug$InfectionType <- factor(nTSCV_CalPlot_xRug$InfectionType, levels=c("Infected", "Never infected"))
+nTSCV_CalPlot_xRug %>% ggplot(aes(x=as.factor(YearPredicted),y=n, fill=InfectionType)) +
+                              geom_bar(stat='identity') +theme_minimal() +
+                              xlab("Year Predicted")+ylab("Number of municipalities")+
+                              scale_fill_manual(values=c("gray25","firebrick2"))+
+                              theme(legend.position="bottom")+
+                              scale_x_discrete(breaks=seq(1997,2019,2))  
+
+nTSCV_CalPlot_yRug1 <- joinedBinned_nTSCVNoIniCon %>% dplyr::filter(!is.na(YearInfected) & is.na(YearPredicted)) %>%
+                                                      group_by(YearInfected) %>%
+                                                      tally() %>%
+                                                      mutate(PredictionType="Never predicted")
+
+nTSCV_CalPlot_yRug2 <- joinedBinned_nTSCVNoIniCon %>% dplyr::filter(!is.na(YearInfected) & !is.na(YearPredicted)) %>%
+                                                      group_by(YearInfected) %>%
+                                                      tally() %>%
+                                                      mutate(PredictionType="Predicted")
+
+nTSCV_CalPlot_yRug <- rbind(nTSCV_CalPlot_yRug1, nTSCV_CalPlot_yRug2) 
+nTSCV_CalPlot_yRug$PredictionType <- factor(nTSCV_CalPlot_yRug$PredictionType, levels = c("Predicted", "Never predicted"))
+nTSCV_CalPlot_yRug %>% ggplot(aes(x=as.factor(YearInfected),y=n, fill=PredictionType)) +
+                              geom_bar(stat='identity') +theme_minimal() +
+                              xlab("Year Infected")+ylab("Number of municipalities")+
+                              scale_fill_manual(values=c("gray25", "firebrick2"))+
+                              theme(legend.position="bottom")+
+                              scale_x_discrete(breaks=seq(1997,2019,2))  
+```
+
+```{r, Break down calibration by region as a channel plot}
+# Create the different dataframes needed
+nTSCV_ChannelDataframes <- createChannelPlotDataframes(joinedBinned_nTSCVNoIniCon)
+nTSCV_ChannelDataframe_LineElement <- nTSCV_ChannelDataframes[[1]]
+nTSCV_ChannelDataframe_I175 <- nTSCV_ChannelDataframes[[2]]
+nTSCV_ChannelDataframe_I195 <- nTSCV_ChannelDataframes[[3]]
+nTSCV_ChannelDataframe_PerfectLine <- data.frame(x = 1997:2019, y = 1997:2019, Region = "North")
+
+# Create the two plots
+ggplot(data=nTSCV_ChannelDataframe_LineElement, aes(x=x, y=y, group=Region))+
+       geom_line(aes(color = Region)) +
+       geom_polygon(data=nTSCV_ChannelDataframe_I175, mapping=aes(x=x, y=y, group = Region, fill = Region), alpha = 0.25) +
+       geom_line(data = nTSCV_ChannelDataframe_PerfectLine, mapping = aes(x=x, y = y), col = "red", lty = 2) +
+       xlab("Year Predicted") +
+       ylab("Year Infected") +
+       theme_bw()+theme(legend.position="bottom")+
+       scale_x_continuous(breaks=seq(1997,2019,2))+
+       scale_y_continuous(breaks=seq(1997,2019,2))+
+       ggtitle("Channel Plot (IQR) - nTSCV Mexico")
+
+ggplot(data=nTSCV_ChannelDataframe_LineElement, aes(x=x, y=y, group=Region))+
+       geom_line(aes(color = Region)) +
+       geom_polygon(data=nTSCV_ChannelDataframe_I195, mapping=aes(x=x, y=y, group = Region, fill = Region), alpha = 0.25) +
+       geom_line(data = nTSCV_ChannelDataframe_PerfectLine, mapping = aes(x=x, y = y), col = "red", lty = 2) +
+       xlab("Year Predicted") +
+       ylab("Year Infected") +
+       theme_bw()+theme(legend.position="bottom")+
+       scale_x_continuous(breaks=seq(1997,2019,2))+
+       scale_y_continuous(breaks=seq(1997,2019,2))+
+       ggtitle("Channel Plot (1:95th %ile) - nTSCV Mexico")
+
+```
+
+s-TSCV: \~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~
+
+```{r, Run short TSCV}
+set.seed(202212)
+
+source("Fx_timeseriesCV_short.R")
+source("Fx_computePerformanceMetrics.R")
+source("Fx_generateSTSCVPredictions.R")
+
+numGAULs <- dim(location_data)[1]
+
+# loop through each year and pre-compute thresholds based on TSCV survival model
+thresholds_sTSCV <- list()
+for(k in 1997:2019){
+  YearIncid <- predictIncidence(Years = k, Country = "Mexico", Current_year = k - 1,
+                                mod_sample = FALSE, mod_mode = "CV")
+  YearIncid = YearIncid[, "Incid"]
+  thresholds_sTSCV = c(thresholds_sTSCV, YearIncid)
+}
+thresholds_sTSCV = unlist(thresholds_sTSCV)
+
+startTime <- Sys.time()
+
+#Model fitting done successively within the timeseriesCV function
+outputs_XGB_TSCV <- timeseriesCV_short(xgb_pretuned_wflow, spread_dat, initialConditions,startYear=1997, 
+                                       numYears=22, numGAULs=numGAULs, confMatrixGAULs=FALSE, thresholds=thresholds_sTSCV)
+metrics_XGB_TSCV <- outputs_XGB_TSCV[[1]]
+predictions_XGB_TSCV <- outputs_XGB_TSCV[[2]]
+
+#Plot results
+AUC_XGB_TSCV <- ggplot(data = metrics_XGB_TSCV, aes(Year, AUC))+
+                geom_jitter(col='seagreen3',width=0.001, height=0)+
+                scale_x_continuous(breaks = scales::pretty_breaks(n = 15))+
+                theme(legend.position = "none")
+ 
+SP_XGB_TSCV <- ggplot(data = metrics_XGB_TSCV, aes(Year, SP))+
+               geom_jitter(col='seagreen3',width=0.001, height=0)+
+               scale_x_continuous(breaks = scales::pretty_breaks(n = 15))+
+               theme(legend.position = "none")
+ 
+SN_XGB_TSCV <- ggplot(data = metrics_XGB_TSCV, aes(Year, SN))+
+               geom_jitter(col='seagreen3',width=0.001, height=0)+
+               scale_x_continuous(breaks = scales::pretty_breaks(n = 15))+
+               theme(legend.position = "none")
+ 
+tscv_xgb <- AUC_XGB_TSCV / SP_XGB_TSCV / SN_XGB_TSCV + 
+            plot_annotation(title = 'Time-series cross-validation on XGBoost model',
+                           caption = 'min_n=, tree_depth=, learn_rate=, loss_reduction=, trees=')
+tscv_xgb
+
+Sys.time() - startTime
+#Takes 20-30 min 
+```
+
+```{r, Create dataframe of residuals}
+########################################################
+# Obtain ground truths on when GAULs became infected ###
+########################################################
+start_year <- 1996
+gtYearInfected <- spread_dat %>% dplyr::filter(Year_end == 1997) %>% 
+                                 dplyr::filter(GAUL %in% initialConditions$GAUL_CODE) %>% 
+                                 dplyr::select(GAUL) %>% 
+                                 mutate(YearInfected = start_year)  
+#Figure out which GAULs are newly infected each year
+for (yearIndex in (1:23)){
+  if (yearIndex == 1){
+    infectedPriorYear <- gtYearInfected %>% dplyr::select(GAUL)
+    infectedThisYear <- spread_dat %>% dplyr::filter(Year_end==(start_year+yearIndex) & Infected == 1) %>% dplyr::select(GAUL)
+  }else{
+    infectedPriorYear <- spread_dat %>% dplyr::filter(Year_end==(start_year+yearIndex-1) & Infected == 1) %>% dplyr::select(GAUL) 
+    infectedThisYear <- spread_dat %>% dplyr::filter(Year_end==(start_year+yearIndex) & Infected == 1) %>% dplyr::select(GAUL)
+  }
+  
+  newlyInfectedGAULs <- dplyr::setdiff(infectedThisYear, infectedPriorYear) %>% mutate(YearInfected = (start_year+yearIndex))
+  
+  #Assignment
+  gtYearInfected <- rbind(gtYearInfected, newlyInfectedGAULs)
+}
+
+
+#Add in the GAULs that never become infected as NA
+neverInfectedGAULS <- spread_dat %>% dplyr::filter(Year_end==2019) %>% dplyr::filter(Infected==0) %>% dplyr::select(GAUL) %>% mutate(YearInfected = NA)
+gtYearInfected <- rbind(gtYearInfected, neverInfectedGAULS)
+
+############################################################
+# Obtain model predictions on when GAULs became infected ###
+############################################################
+
+#Bind all the dataframes in the returned list into one
+joinedPredictions_XGB_sTSCV <- bind_rows(predictions_XGB_TSCV)
+
+predictionsYearInfected <- joinedPredictions_XGB_sTSCV %>% group_by(GAUL) %>% 
+                                                           dplyr::filter(Prediction == 1) %>% 
+                                                           dplyr::filter(Year == min(Year)) %>% 
+                                                           rename(YearInfected=Year) %>% 
+                                                           dplyr::select(GAUL, YearInfected)
+
+#Left join to get all GAULs in ground truth
+joined_sTSCV <- merge(x=gtYearInfected, y=predictionsYearInfected, by="GAUL", all.x=T) %>% 
+                dplyr::rename(YearInfected = YearInfected.x,
+                              YearPredicted = YearInfected.y)
+
+joined_sTSCV <- joined_sTSCV %>% mutate(Residual = YearInfected - YearPredicted) %>% 
+                                 mutate(Residual = case_when((is.na(YearInfected) & is.na(YearPredicted)) ~ 0,
+                                                             (!is.na(YearInfected) & is.na(YearPredicted)) ~ -20,
+                                                             (is.na(YearInfected) & !is.na(YearPredicted)) ~ 20,
+                                                             TRUE ~ as.numeric(Residual)))
+
+joinedBinned_sTSCV <- joined_sTSCV %>% mutate(Residual = case_when(Residual > 4 ~ 5,
+                                                       Residual < -4 ~ -5,
+                                                       TRUE ~ as.numeric(Residual)))
+
+#Add region to each GAUL 
+joinedBinned_sTSCV$Region = ""
+for(i in 1:nrow(joinedBinned_sTSCV)){
+  municipality_GAUL <- joinedBinned_sTSCV$GAUL[i]
+  admin2_index <- match(municipality_GAUL, admin2$GAUL_CODE)
+  state_name <- admin2[admin2_index,]$ADM1_ES
+  region_name <- unname(getRegion[state_name])
+  joinedBinned_sTSCV$Region[i] <- region_name
+}
+
+joinedBinned_sTSCVNoIniCon <- joinedBinned_sTSCV %>% filter(!(GAUL %in% initialConditions$GAUL_CODE))
+
+joinedBinnedSpatial_sTSCV <- merge(admin2, joinedBinned_sTSCV, by.x="GAUL_CODE", by.y="GAUL")
+```
+
+```{r, Plot year of predicted infection}
+map_preds <- tm_shape(joinedBinnedSpatial_sTSCV) +
+             tm_polygons(border.col = "black")+ 
+             tm_shape(joinedBinnedSpatial_sTSCV) +
+             tm_fill("YearPredicted", palette="YlOrRd", title = "Year of predicted invasion",
+                     breaks= c(1996, 1998, 2000, 2002, 2004, 2006, 2008, 2010, 2012, 2014, 2016, 2018,2020),
+                     textNA = "Dengue not predicted as of 2020")+
+             tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.fontface = "bold",
+                       legend.format=list(fun=function(x) formatC(x, digits=0, format="d")))
+
+map_preds
+```
+
+```{r, Plot residuals as a map}
+map_residuals <- tm_shape(joinedBinnedSpatial_sTSCV) +
+                 tm_polygons(border.col = "black")+ 
+                 tm_shape(joinedBinnedSpatial_sTSCV) +
+                 tm_fill("Residual", palette="PuOr", n=11, style="cont")+
+                 tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.fontface = "bold")
+
+map_residuals
+```
+
+```{r, Plot residuals as a bargraph }
+joinedBinned_sTSCV <- joinedBinned_sTSCV %>% mutate(Residual = case_when(Residual < 0 ~ "Missed",
+                                                   TRUE ~ as.character(Residual))) 
+joinedBinned_sTSCV$Residual <- factor(joinedBinned_sTSCV$Residual, levels=c("Missed", "0","1","2","3","4","5"))
+
+palette_sTSCV <- brewer.pal(n = 11, name = "PuOr")
+palette_sTSCV <- palette_sTSCV[6:11]
+palette_sTSCV <- c("#1a1919", palette_sTSCV)
+
+joinedBinned_sTSCV %>% ggplot(aes(x=Residual, fill=Residual)) + 
+                              geom_bar(stat="count", colour="black")+theme_bw() +
+                              theme(axis.title.x = element_text( face = "bold"),
+                                    axis.title.y = element_text( face = "bold"),
+                                    legend.position = "none")+
+                              ylab("Number of municipalities with value")+
+                              scale_fill_manual(values=palette_sTSCV)
+```
+
+```{r, Plot residuals as calibration curve}
+x <- c(1997:2019)
+y <- c(1997:2019)
+perfectCal <- data.frame(x,y)
+
+joinedBinned_sTSCVNoIniCon %>% dplyr::filter(!is.na(YearInfected) & !is.na(YearPredicted)) %>%
+                 ggplot(aes(x=as.factor(YearPredicted), y=YearInfected))+
+                 geom_boxplot()+theme_bw()+ggtitle("Calibration - sTSCV Mexico")+
+                 xlab("Year Predicted") + ylab("Year Infected")+
+                 geom_line(data=perfectCal, aes(x=as.factor(x), y=y, group = 1), color="red")+ 
+                 geom_point(data=perfectCal, aes(x=as.factor(x), y=y, group = 1), color="red")+ 
+                 scale_x_discrete(breaks=seq(1996,2019,2)) +                                   
+                 scale_y_continuous(breaks=seq(1996,2019,2))
+
+sTSCV_CalPlot_xRug1  <- joinedBinned_sTSCVNoIniCon %>% dplyr::filter(is.na(YearInfected) & !is.na(YearPredicted)) %>%
+                                                       group_by(YearPredicted) %>%
+                                                       tally() %>%
+                                                       mutate(InfectionType="Never infected")
+
+sTSCV_CalPlot_xRug2  <- joinedBinned_sTSCVNoIniCon %>% dplyr::filter(!is.na(YearInfected) & !is.na(YearPredicted)) %>%
+                                                       group_by(YearPredicted) %>%
+                                                       tally() %>%
+                                                       mutate(InfectionType="Infected")
+
+sTSCV_CalPlot_xRug <- rbind(sTSCV_CalPlot_xRug1, sTSCV_CalPlot_xRug2) 
+sTSCV_CalPlot_xRug$InfectionType <- factor(sTSCV_CalPlot_xRug$InfectionType, levels=c("Infected", "Never infected"))
+sTSCV_CalPlot_xRug %>% ggplot(aes(x=as.factor(YearPredicted),y=n, fill=InfectionType)) +
+                              geom_bar(stat='identity') +theme_minimal() +
+                              xlab("Year Predicted")+ylab("Number of municipalities")+
+                              scale_fill_manual(values=c("gray25","firebrick2"))+
+                              theme(legend.position="bottom")+
+                              scale_x_discrete(breaks=seq(1996,2019,2))  
+
+sTSCV_CalPlot_yRug1 <- joinedBinned_sTSCVNoIniCon %>% dplyr::filter(!is.na(YearInfected) & is.na(YearPredicted)) %>%
+                                                      group_by(YearInfected) %>%
+                                                      tally() %>%
+                                                      mutate(PredictionType="Never predicted")
+
+sTSCV_CalPlot_yRug2 <- joinedBinned_sTSCVNoIniCon %>% dplyr::filter(!is.na(YearInfected) & !is.na(YearPredicted)) %>%
+                                                      group_by(YearInfected) %>%
+                                                      tally() %>%
+                                                      mutate(PredictionType="Predicted")
+
+sTSCV_CalPlot_yRug <- rbind(sTSCV_CalPlot_yRug1, sTSCV_CalPlot_yRug2) 
+sTSCV_CalPlot_yRug$PredictionType <- factor(sTSCV_CalPlot_yRug$PredictionType, levels = c("Predicted", "Never predicted"))
+sTSCV_CalPlot_yRug %>% ggplot(aes(x=as.factor(YearInfected),y=n, fill=PredictionType)) +
+                              geom_bar(stat='identity') +theme_minimal() +
+                              xlab("Year Infected")+ylab("Number of municipalities")+
+                              scale_fill_manual(values=c("gray25", "firebrick2"))+
+                              theme(legend.position="bottom")+
+                              scale_x_discrete(breaks=seq(1996,2019,2))  
+```
+
+```{r, Break down calibration by region as a channel plot}
+# Create the different dataframes needed
+sTSCV_ChannelDataframes <- createChannelPlotDataframes(joinedBinned_sTSCVNoIniCon)
+sTSCV_ChannelDataframe_LineElement <- sTSCV_ChannelDataframes[[1]]
+sTSCV_ChannelDataframe_I175 <- sTSCV_ChannelDataframes[[2]]
+sTSCV_ChannelDataframe_I195 <- sTSCV_ChannelDataframes[[3]]
+sTSCV_ChannelDataframe_PerfectLine <- data.frame(x = 2001:2019, y = 2001:2019, Region = "North")
+
+# Create the two plots
+ggplot(data=sTSCV_ChannelDataframe_LineElement, aes(x=x, y=y, group=Region))+
+       geom_line(aes(color = Region)) +
+       geom_polygon(data=sTSCV_ChannelDataframe_I175, mapping=aes(x=x, y=y, group = Region, fill = Region), alpha = 0.25) +
+       geom_line(data = sTSCV_ChannelDataframe_PerfectLine, mapping = aes(x=x, y = y), col = "red", lty = 2) +
+       xlab("Year Predicted") +
+       ylab("Year Infected") +
+       theme_bw()+theme(legend.position="bottom")+
+       scale_x_continuous(breaks=seq(1995,2019,2))+
+       scale_y_continuous(breaks=seq(1995,2019,2))+
+       ggtitle("Channel Plot (IQR) - sTSCV Mexico")
+
+ggplot(data=sTSCV_ChannelDataframe_LineElement, aes(x=x, y=y, group=Region))+
+       geom_line(aes(color = Region)) +
+       geom_polygon(data=sTSCV_ChannelDataframe_I195, mapping=aes(x=x, y=y, group = Region, fill = Region), alpha = 0.25) +
+       geom_line(data = sTSCV_ChannelDataframe_PerfectLine, mapping = aes(x=x, y = y), col = "red", lty = 2) +
+       xlab("Year Predicted") +
+       ylab("Year Infected") +
+       theme_bw()+theme(legend.position="bottom")+
+       scale_x_continuous(breaks=seq(1995,2019,2))+
+       scale_y_continuous(breaks=seq(1995,2019,2))+
+       ggtitle("Channel Plot (1:95th %ile) - sTSCV Mexico")
+
+```
+
+m-TSCV: \~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~
+
+```{r, Run medium TSCV}
+set.seed(202212)
+
+#Load in intermediate datasets 
+setwd("/Users/eideobra/Dropbox/08_Serotype_spread/")
+load("Data/Intermediate_datasets/Mexico_Aegypti_sum.RData")
+load("Data/Intermediate_datasets/Mexico_EVI_sum.RData")
+load("Data/Intermediate_datasets/Mexico_LandCover_sum.RData")
+load("Data/Intermediate_datasets/Mexico_LST_day_sum.RData")
+load("Data/Intermediate_datasets/Mexico_LST_night_sum.RData")
+load("Data/Intermediate_datasets/Mexico_TCB_sum.RData")
+load("Data/Intermediate_datasets/Mexico_TCW_sum.RData")
+
+# remove 2015 values for LST and EVI due to anomalous values not supported by ground observations 
+# (annual trend still compensated due to future projection analysis)
+Mexico_EVI_sum <- Mexico_EVI_sum[, !grepl("2015", colnames(Mexico_EVI_sum))]
+Mexico_LST_day_sum <- Mexico_LST_day_sum[, !grepl("2015", colnames(Mexico_LST_day_sum))]
+Mexico_LST_night_sum <- Mexico_LST_night_sum[, !grepl("2015", colnames(Mexico_LST_night_sum))]
+
+# A) simple great circle distance for now
+load("Data/Intermediate_datasets/dist_mat_GC_Mexico.RData")
+# GC transformation (emphasises close places)
+dist_mat_GC = 1 / (dist_mat_GC + 1)
+  
+ # B) gravity model
+load("Data/Intermediate_datasets/Gravity_matrix_Mexico.RData")
+  
+# c) Radiation model
+load("Data/Intermediate_datasets/Radiation_matrix_Mexico.RData")
+  
+# D) Adjacency model
+load("Data/Intermediate_datasets/dist_mat_Adjacency_Mexico.RData")
+  
+# E) flight data
+load("Data/Intermediate_datasets/Mexico_air_move_mat_ad2.RData")
+  
+# F) Worldpop internal migration flows (state level)
+load("Data/Intermediate_datasets/Mexico_Migration_mat.RData")
+  
+# G) MAP friction surface- travel time between biggest cities in each municiaplity
+load("Data/Intermediate_datasets/Mexico_Friction_mat.RData")
+# Friction transformation (emphasises accessible places)
+dist_mat_Friction = 1 / (dist_mat_Friction + 1)
+
+# exclude self connections in all distance matrices
+diag(dist_mat_Adjacency) <- diag(dist_mat_Air) <- diag(dist_mat_Friction) <- NA
+diag(dist_mat_GC) <- diag(dist_mat_Grav) <- diag(dist_mat_Migration) <- diag(dist_mat_Rad) <- NA
+
+LST_day_m_FP <- read.csv("Data/Intermediate_datasets/Future_pred/MeanDayTemperature_Mexico.csv")
+LST_day_sd_FP <- read.csv("Data/Intermediate_datasets/Future_pred/SDDayTemperature_Mexico.csv")
+LST_night_m_FP <- read.csv("Data/Intermediate_datasets/Future_pred/MeanNightTemperature_Mexico.csv")
+LST_night_sd_FP <- read.csv("Data/Intermediate_datasets/Future_pred/SDNightTemperature_Mexico.csv")
+EVI_m_FP <- read.csv("Data/Intermediate_datasets/Future_pred/MeanEVI_Mexico.csv")
+EVI_sd_FP <- read.csv("Data/Intermediate_datasets/Future_pred/SDEVI_Mexico.csv")
+TCW_sd_FP <- read.csv("Data/Intermediate_datasets/Future_pred/SDTCW_Mexico.csv")
+Movement_FP <- read.csv("Data/Intermediate_datasets/Future_pred/Movement_Mexico.csv")
+
+#Load in helper functions
+source("/Users/eideobra/Dropbox/08_Serotype_spread/Denspread_code/ModellingSandbox/Fx_suitAssemble.R")
+source("/Users/eideobra/Dropbox/08_Serotype_spread/Denspread_code/ModellingSandbox/Fx_addCovariatesMex.R")
+source("/Users/eideobra/Dropbox/08_Serotype_spread/Denspread_code/ModellingSandbox/Fx_timeseriesCV_mediumMex.R")
+source("/Users/eideobra/Dropbox/08_Serotype_spread/Denspread_code/ModellingSandbox/Fx_computePerformanceMetricsMTSCV.R")
+
+#Model fitting done within the timeseriesCV function
+# loop through each year and pre-compute thresholds based on TSCV survival model
+thresholds_mTSCV <- list()
+for(k in 1997:2019){
+  YearIncid <- predictIncidence(Years = k, Country = "Mexico", Current_year = k - 1,
+                                mod_sample = FALSE, mod_mode = "CV")
+  YearIncid = YearIncid[, "Incid"]
+  thresholds_mTSCV = c(thresholds_mTSCV, YearIncid)
+}
+thresholds_mTSCV = unlist(thresholds_mTSCV)
+
+
+startTime <- Sys.time()
+
+outputs_medTSCV <- timeseriesCV_mediumMex(xgb_pretuned_wflow, spread_dat, initialConditions, 
+                                          numYears=23, thresholds_mTSCV, regions_states_LUT)
+metrics_XGB_medTSCV <- outputs_medTSCV[[1]]
+predictions_XGB_medTSCV <- outputs_medTSCV[[2]]
+probabilities_XGB_medTSCV <- outputs_medTSCV[[3]]
+
+#Plot results
+AUC_XGB_year_med <- ggplot(data = metrics_XGB_medTSCV, aes(Year, AUC))+
+                    geom_jitter(col='seagreen3',width=0.001, height=0)+
+                    scale_x_continuous(breaks = scales::pretty_breaks(n = 13))+
+                    theme(legend.position = "none")
+ 
+SP_XGB_year_med <- ggplot(data = metrics_XGB_medTSCV, aes(Year, SP))+
+                   geom_jitter(col='seagreen3',width=0.001, height=0)+
+                   scale_x_continuous(breaks = scales::pretty_breaks(n = 13))+
+                   theme(legend.position = "none")
+ 
+SN_XGB_year_med <- ggplot(data = metrics_XGB_medTSCV, aes(Year, SN))+
+                   geom_jitter(col='seagreen3',width=0.001, height=0)+
+                   scale_x_continuous(breaks = scales::pretty_breaks(n = 13))+
+                   theme(legend.position = "none")
+ 
+tscv_xgb_med <- (AUC_XGB_year_med / SP_XGB_year_med / SN_XGB_year_med) + 
+                plot_annotation(title = 'Medium-term time-series cross-validation on XGBoost model')
+tscv_xgb_med
+
+Sys.time() - startTime
+#Takes <5 min 
+```
+
+```{r, Create dataframe of residuals}
+########################################################
+# Obtain ground truths on when GAULs became infected ###
+########################################################
+start_year <- 1996
+gtYearInfected <- spread_dat %>% dplyr::filter(Year_end == 1997) %>% 
+                                 dplyr::filter(GAUL %in% initialConditions$GAUL_CODE) %>% 
+                                 dplyr::select(GAUL) %>% 
+                                 mutate(YearInfected = start_year)  
+#Figure out which GAULs are newly infected each year
+for (yearIndex in (1:23)){
+  if (yearIndex == 1){
+    infectedPriorYear <- gtYearInfected %>% dplyr::select(GAUL)
+    infectedThisYear <- spread_dat %>% dplyr::filter(Year_end==(start_year+yearIndex) & Infected == 1) %>% dplyr::select(GAUL)
+  }else{
+    infectedPriorYear <- spread_dat %>% dplyr::filter(Year_end==(start_year+yearIndex-1) & Infected == 1) %>% dplyr::select(GAUL) 
+    infectedThisYear <- spread_dat %>% dplyr::filter(Year_end==(start_year+yearIndex) & Infected == 1) %>% dplyr::select(GAUL)
+  }
+  
+  newlyInfectedGAULs <- dplyr::setdiff(infectedThisYear, infectedPriorYear) %>% mutate(YearInfected = (start_year+yearIndex))
+  
+  #Assignment
+  gtYearInfected <- rbind(gtYearInfected, newlyInfectedGAULs)
+}
+
+
+#Add in the GAULs that never become infected as NA
+neverInfectedGAULS <- spread_dat %>% dplyr::filter(Year_end==2019) %>% dplyr::filter(Infected==0) %>% dplyr::select(GAUL) %>% mutate(YearInfected = NA)
+gtYearInfected <- rbind(gtYearInfected, neverInfectedGAULS)
+
+############################################################
+# Obtain model predictions on when GAULs became infected ###
+############################################################
+#Add year indices into the list of dataframes returned
+start_year <- 1996
+for (yearIndex in (1:23)){
+  predictions_XGB_medTSCV[[yearIndex]] <- predictions_XGB_medTSCV[[yearIndex]] %>% mutate(PredictionYear=(start_year + yearIndex))
+}
+
+#Bind all the dataframes in the returned list into one
+joinedPredictions_XGB_medTSCV <- bind_rows(predictions_XGB_medTSCV)
+
+#Base case is the GAULs in initial conditions
+predictionsYearInfected <- spread_dat %>% dplyr::filter(Year_end == 1997) %>% 
+                                          dplyr::filter(GAUL %in% initialConditions$GAUL_CODE) %>% 
+                                          dplyr::select(GAUL) %>% 
+                                          mutate(YearInfected = start_year) 
+
+for (yearIndex in (1:23)){
+  if (yearIndex == 1){
+    infectedPriorYear <- predictionsYearInfected %>% dplyr::select(GAUL)
+    infectedThisYear <- joinedPredictions_XGB_medTSCV %>% dplyr::filter(PredictionYear==(start_year+yearIndex) & Infected == 1) %>% 
+                                                          dplyr::select(GAUL)
+  }else{
+    infectedPriorYear <- predictionsYearInfected %>% dplyr::select(GAUL) 
+    infectedThisYear <- joinedPredictions_XGB_medTSCV %>% dplyr::filter(PredictionYear==(start_year+yearIndex) & Infected == 1) %>% 
+                                                          dplyr::select(GAUL)
+  }
+  
+  newlyInfectedGAULs <- dplyr::setdiff(infectedThisYear, infectedPriorYear) %>% mutate(YearInfected = (start_year+yearIndex))
+  
+  #Assignment
+ predictionsYearInfected <- rbind(predictionsYearInfected, newlyInfectedGAULs)
+}
+
+#Left join to get all GAULs in ground truth
+joined <- merge(x=gtYearInfected, y=predictionsYearInfected, by="GAUL", all.x=T) %>% 
+          dplyr::rename(YearInfected = YearInfected.x,
+                        YearPredicted = YearInfected.y)
+
+joined <- joined %>% mutate(Residual = YearInfected - YearPredicted) %>% 
+                     mutate(Residual = case_when((is.na(YearInfected) & is.na(YearPredicted)) ~ 0,
+                                                 (!is.na(YearInfected) & is.na(YearPredicted)) ~ -20,
+                                                 (is.na(YearInfected) & !is.na(YearPredicted)) ~ 20,
+                                                 TRUE ~ as.numeric(Residual)))
+
+joinedBinned <- joined %>% mutate(Residual = case_when(Residual > 4 ~ 5,
+                                                       Residual < -4 ~ -5,
+                                                       TRUE ~ as.numeric(Residual)))
+
+#Add region to each GAUL 
+joinedBinned$Region = ""
+for(i in 1:nrow(joinedBinned)){
+  municipality_GAUL <- joinedBinned$GAUL[i]
+  admin2_index <- match(municipality_GAUL, admin2$GAUL_CODE)
+  state_name <- admin2[admin2_index,]$ADM1_ES
+  region_name <- unname(getRegion[state_name])
+  joinedBinned$Region[i] <- region_name
+}
+
+joinedBinnedSpatial <- merge(admin2, joinedBinned, by.x="GAUL_CODE", by.y="GAUL")
+
+joinedBinnedNoIniCon <- joinedBinned %>% dplyr::filter(!(GAUL %in% initialConditions$GAUL_CODE))
+
+#Save residuals to file 
+SAVE_RESIDUALS = FALSE
+if (SAVE_RESIDUALS == TRUE){
+  export <- joinedBinned %>% dplyr::select(GAUL, Residual)
+  write.csv(export, "mTSCV-XGB-MexicoToMexico_Residuals.csv")  
+}
+```
+
+```{r, Plot year of predicted infection}
+map_preds <- tm_shape(joinedBinnedSpatial) +
+             tm_polygons(border.col = "black")+ 
+             tm_shape(joinedBinnedSpatial) +
+             tm_fill("YearPredicted", palette="YlOrRd", title = "Year of predicted invasion",
+                     breaks= c(1996, 1998, 2000, 2002, 2004, 2006, 2008, 2010, 2012, 2014, 2016, 2018,2020),
+                     textNA = "Dengue not predicted as of 2020")+
+             tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.fontface = "bold",
+                       legend.format=list(fun=function(x) formatC(x, digits=0, format="d")))
+
+map_preds
+```
+
+```{r, Plot residuals as a map}
+map_residuals <- tm_shape(joinedBinnedSpatial) +
+                 tm_polygons(border.col = "black")+ 
+                 tm_shape(joinedBinnedSpatial) +
+                 tm_fill("Residual", 
+                         palette="PuOr",
+                         labels= c("-5 (late)", "-4", "-3", "-2", "-1", "0", "1", "2", "3", "4","5 (early)"),
+                         n=11, midpoint = 0, style="cat")+
+                 tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.fontface = "bold")
+
+map_residuals
+```
+
+```{r, Plot residuals as a bargraph}
+joinedBinned %>% ggplot(aes(x=Residual, fill=as.factor(Residual))) + 
+                 geom_bar(stat="count", colour="black")+theme_bw() +
+                 theme(axis.title.x = element_text(face = "bold", size = 14),
+                       axis.title.y = element_text(face = "bold", size = 14),
+                       axis.text.x = element_text(size = 12, margin = margin(t = 10, r = 0, b = 6, l = 0)),
+                       axis.text.y = element_text(size = 12, margin = margin(t = 0, r = 6, b = 0, l = 0)),
+                       legend.position = "none")+
+                 ylab("Number of municipalities with value")+
+                 scale_x_continuous(breaks = seq(-5,5, by = 1))+
+                 scale_fill_brewer(palette="PuOr")
+```
+
+```{r, Plot residuals as calibration curve}
+x <- c(1997:2019)
+y <- c(1997:2019)
+perfectCal <- data.frame(x,y)
+
+joinedBinnedNoIniCon %>% dplyr::filter(!is.na(YearInfected) & !is.na(YearPredicted)) %>%
+                         ggplot(aes(x=as.factor(YearPredicted), y=YearInfected))+
+                         geom_boxplot()+theme_bw()+ggtitle("Calibration - mTSCV Mexico")+
+                         xlab("Year Predicted") + ylab("Year Infected")+
+                         geom_line(data=perfectCal, aes(x=as.factor(x), y=y, group = 1), color="red")+ 
+                         geom_point(data=perfectCal, aes(x=as.factor(x), y=y, group = 1), color="red")+ 
+                         scale_x_discrete(breaks=seq(1997,2019,2)) +                                   
+                         scale_y_continuous(breaks=seq(1997,2019,2))
+
+
+mTSCV_CalPlot_xRug1  <- joinedBinnedNoIniCon %>% dplyr::filter(is.na(YearInfected) & !is.na(YearPredicted)) %>%
+                                                 group_by(YearPredicted) %>%
+                                                 tally() %>%
+                                                 mutate(InfectionType="Never infected")
+
+mTSCV_CalPlot_xRug2  <- joinedBinnedNoIniCon %>% dplyr::filter(!is.na(YearInfected) & !is.na(YearPredicted)) %>%
+                                                 group_by(YearPredicted) %>%
+                                                 tally() %>%
+                                                 mutate(InfectionType="Infected")
+
+mTSCV_CalPlot_xRug <- rbind(mTSCV_CalPlot_xRug1, mTSCV_CalPlot_xRug2) 
+mTSCV_CalPlot_xRug$InfectionType <- factor(mTSCV_CalPlot_xRug$InfectionType, levels=c("Infected", "Never infected"))
+mTSCV_CalPlot_xRug %>% ggplot(aes(x=as.factor(YearPredicted),y=n, fill=InfectionType)) +
+                              geom_bar(stat='identity') +theme_minimal() +
+                              xlab("Year Predicted")+ylab("Number of municipalities")+
+                              scale_fill_manual(values=c("gray25","firebrick2"))+
+                              theme(legend.position="bottom")+
+                              scale_x_discrete(breaks=seq(1997,2019,2)) 
+
+mTSCV_CalPlot_yRug1 <- joinedBinnedNoIniCon %>% dplyr::filter(!is.na(YearInfected) & is.na(YearPredicted)) %>%
+                                                group_by(YearInfected) %>%
+                                                tally() %>%
+                                                mutate(PredictionType="Never predicted")
+
+mTSCV_CalPlot_yRug2 <- joinedBinnedNoIniCon %>% dplyr::filter(!is.na(YearInfected) & !is.na(YearPredicted)) %>%
+                                                group_by(YearInfected) %>%
+                                                tally() %>%
+                                                mutate(PredictionType="Predicted")
+
+mTSCV_CalPlot_yRug <- rbind(mTSCV_CalPlot_yRug1, mTSCV_CalPlot_yRug2) 
+mTSCV_CalPlot_yRug$PredictionType <- factor(mTSCV_CalPlot_yRug$PredictionType, levels = c("Predicted", "Never predicted"))
+mTSCV_CalPlot_yRug %>% ggplot(aes(x=as.factor(YearInfected),y=n, fill=PredictionType)) +
+                              geom_bar(stat='identity') +theme_minimal() +
+                              xlab("Year Infected")+ylab("Number of municipalities")+
+                              scale_fill_manual(values=c("gray25", "firebrick2"))+
+                              theme(legend.position="bottom")+ 
+                              scale_x_discrete(breaks=seq(1997,2019,2)) 
+```
+
+```{r, Break down calibration by region as a channel plot}
+# Create the different dataframes needed
+mTSCV_ChannelDataframes <- createChannelPlotDataframes(joinedBinnedNoIniCon)
+mTSCV_ChannelDataframe_LineElement <- mTSCV_ChannelDataframes[[1]]
+mTSCV_ChannelDataframe_I175 <- mTSCV_ChannelDataframes[[2]]
+mTSCV_ChannelDataframe_I195 <- mTSCV_ChannelDataframes[[3]]
+mTSCV_ChannelDataframe_PerfectLine <- data.frame(x = 1997:2019, y = 1997:2019, Region = "North")
+
+# Create the two plots
+ggplot(data=mTSCV_ChannelDataframe_LineElement, aes(x=x, y=y, group=Region))+
+       geom_line(aes(color = Region)) +
+       geom_polygon(data=mTSCV_ChannelDataframe_I175, mapping=aes(x=x, y=y, group = Region, fill = Region), alpha = 0.25) +
+       geom_line(data = mTSCV_ChannelDataframe_PerfectLine, mapping = aes(x=x, y = y), col = "red", lty = 2) +
+       xlab("Year Predicted") +
+       ylab("Year Infected") +
+       theme_bw()+theme(legend.position="bottom")+
+       scale_x_continuous(breaks=seq(1997,2019,2))+
+       scale_y_continuous(breaks=seq(1997,2019,2))+
+       ggtitle("Channel Plot (IQR) - mTSCV Mexico")
+
+ggplot(data=mTSCV_ChannelDataframe_LineElement, aes(x=x, y=y, group=Region))+
+       geom_line(aes(color = Region)) +
+       geom_polygon(data=mTSCV_ChannelDataframe_I195, mapping=aes(x=x, y=y, group = Region, fill = Region), alpha = 0.25) +
+       geom_line(data = mTSCV_ChannelDataframe_PerfectLine, mapping = aes(x=x, y = y), col = "red", lty = 2) +
+       xlab("Year Predicted") +
+       ylab("Year Infected") +
+       theme_bw()+theme(legend.position="bottom")+
+       scale_x_continuous(breaks=seq(1997,2019,2))+
+       scale_y_continuous(breaks=seq(1997,2019,2))+
+       ggtitle("Channel Plot (1:95th %ile) - mTSCV Mexico")
+
+```
+
+```{r, Check to see if the year over year predictions make sense}
+#Define function for ease of re-use
+createConfusionMap <- function(year){
+  preds <- joinedPredictions_XGB_medTSCV %>% dplyr::filter(PredictionYear == year) %>% 
+                                             mutate(Infected = as.factor(Infected)) %>%
+                                             select(GAUL, Infected) %>%
+                                             rename(Prediction = Infected)
+
+  labs <- spread_dat %>% dplyr::filter(Year_end == year) %>%
+                         select(GAUL, Infected) %>%
+                         rename(Label = Infected)
+  #Legend for mapping
+    # TN = 0
+    # TP = 1
+    # FN = 2
+    # FP = 3 
+  
+  confusionDF <- left_join(preds, labs) %>% 
+                 mutate(Confusion = case_when(Prediction == 0 & Label == 0 ~ 0,
+                                               Prediction == 1 & Label == 1 ~ 1,
+                                               Prediction == 0 & Label == 1 ~ 2,
+                                               Prediction == 1 & Label == 0 ~ 3)) %>%
+                 mutate(Confusion = as.factor(Confusion))
+  confusionDF <- merge(admin2, confusionDF, by.x="GAUL_CODE", by.y="GAUL")
+  
+
+  confusionMap <- tm_shape(confusionDF) +
+                  tm_polygons(border.col = "black") + 
+                  tm_shape(confusionDF) +
+                  tm_fill("Confusion", title = paste(year, "Confusion Map"), labels=c("TN", "TP", "FN", "FP"))+
+                  tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.fontface = "bold")
+}
+
+confMap01 <- createConfusionMap(2001)
+confMap02 <- createConfusionMap(2002)
+confMap03 <- createConfusionMap(2003)
+confMap04 <- createConfusionMap(2004)
+confMap05 <- createConfusionMap(2005)
+confMap06 <- createConfusionMap(2006)
+confMap07 <- createConfusionMap(2007)
+confMap08 <- createConfusionMap(2008)
+confMap09 <- createConfusionMap(2009)
+confMap10 <- createConfusionMap(2010)
+
+confMap01
+confMap02
+confMap03
+confMap04
+confMap05
+confMap06
+confMap07
+confMap08
+confMap09
+confMap10
+```
+
+```{r, Check variable importance}
+#Fit prespecified model to all the data
+xgb_pretuned_wflow_fit <- xgb_pretuned_wflow %>%  
+  fit(data = spread_dat)
+
+xgb_pretuned_wflow_fit %>% pull_workflow_fit() %>% vi() %>% mutate(Importance = abs(Importance),
+                                                           Variable = fct_reorder(Variable, Importance)) %>%
+                                              ggplot(aes(x = Importance, y = Variable)) +
+                                                      geom_col() +
+                                                      scale_x_continuous(expand = c(0, 0)) +
+                                                      labs(y = NULL)
+```
+
+```{r, Examine probabilities of newly invaded GAULs over time}
+#Add year indices into the list of dataframes returned
+start_year <- 1996
+for (yearIndex in (1:23)){
+  probabilities_XGB_medTSCV[[yearIndex]] <- probabilities_XGB_medTSCV[[yearIndex]] %>% mutate(PredictionYear=(start_year + yearIndex))
+}
+probabilities_XGB_medTSCV <- bind_rows(probabilities_XGB_medTSCV)
+
+probabilities_XGB_medTSCV$Region = ""
+for(i in 1:nrow(probabilities_XGB_medTSCV)){
+  municipality_GAUL <- probabilities_XGB_medTSCV$GAUL[i]
+  admin2_index <- match(municipality_GAUL, admin2$GAUL_CODE)
+  state_name <- admin2[admin2_index,]$ADM1_ES
+  region_name <- unname(getRegion[state_name])
+  probabilities_XGB_medTSCV$Region[i] <- region_name
+}
+
+probabilities_XGB_medTSCV %>% ggplot(aes(x=as.factor(PredictionYear), y=.pred_1))+
+                                    ggbeeswarm::geom_quasirandom()
+
+probabilities_XGB_medTSCV %>% ggplot(aes(x=as.factor(PredictionYear), y=.pred_1))+
+                                    ggbeeswarm::geom_quasirandom(aes(color=Region))+
+                                    theme(legend.position = "bottom")+
+                                    scale_x_discrete(breaks=seq(1996,2019,2))
+```
+
+Summarize TSCV: \~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~
+
+```{r, Reprocess naive TSCV to get means}
+naive_meanAUCs <- naive_metrics_Yearly %>% 
+                  group_by(Metric) %>% 
+                  dplyr::filter(Metric=="AUC") %>% 
+                  group_by(Year) %>% 
+                  summarise(mean(unlist(Value), na.rm = TRUE)) %>%
+                  rename(Value = `mean(unlist(Value), na.rm = TRUE)`)
+
+naive_meanAUCs$Year <- rep(seq(from=1997, to=2019), each=1)
+naive_meanAUCs$Metric <- "AUC"
+
+naive_meanSPs <- naive_metrics_Yearly %>% 
+                  group_by(Metric) %>% 
+                  dplyr::filter(Metric=="SP") %>% 
+                  group_by(Year) %>% 
+                  summarise(mean(unlist(Value), na.rm = TRUE)) %>%
+                  rename(Value = `mean(unlist(Value), na.rm = TRUE)`)
+
+naive_meanSPs$Year <- rep(seq(from=1997, to=2019), each=1)
+naive_meanSPs$Metric <- "SP"
+
+naive_meanSNs <- naive_metrics_Yearly %>% 
+                  group_by(Metric) %>% 
+                  dplyr::filter(Metric=="SN") %>% 
+                  group_by(Year) %>% 
+                  summarise(mean(unlist(Value), na.rm = TRUE)) %>%
+                  rename(Value = `mean(unlist(Value), na.rm = TRUE)`)
+
+naive_meanSNs$Year <- rep(seq(from=1997, to=2019), each=1)
+naive_meanSNs$Metric <- "SN"
+
+naive_meanMetrics <- rbind(naive_meanAUCs, naive_meanSPs, naive_meanSNs)
+naive_meanMetrics$Type <- "Naive"
+```
+
+```{r, Plot naive, short, and medium TSCV together}
+metrics_XGB_TSCV$Type <- "Short"
+metrics_XGB_medTSCV$Type <- "Medium"
+
+metrics_XGB_combined_TSCV <- rbind(metrics_XGB_TSCV, metrics_XGB_medTSCV) %>% 
+                             pivot_longer(! c(ProbThres,Year,Type), names_to = "Metric", values_to ="Value") %>%
+                             dplyr::select(-ProbThres)
+                                                                   
+metrics_XGB_combined_TSCV <- rbind(metrics_XGB_combined_TSCV,naive_meanMetrics )
+
+
+metrics_XGB_combined_TSCV %>% ggplot(aes(x = Year, y = Value, group=Type)) + 
+                              geom_line(aes(color=Type)) + geom_point(aes(color=Type))+
+                              facet_wrap(~Metric, scales="free") + theme_bw() +
+                              theme(axis.title.x = element_text( face = "bold"),
+                                    axis.title.y = element_text( face = "bold"))+
+                              scale_color_manual(values = c("#E45197", "#F78520", "#0E336D"))
+```
+
+Future projections:\~\~\~\~\~\~\~\~\~\~\~\~\~\~
+
+```{r, Load in data and helper functions}
+set.seed(202212)
+
+#Load in intermediate datasets 
+setwd("/Users/eideobra/Dropbox/08_Serotype_spread/")
+load("Data/Intermediate_datasets/Mexico_Aegypti_sum.RData")
+load("Data/Intermediate_datasets/Mexico_EVI_sum.RData")
+load("Data/Intermediate_datasets/Mexico_LandCover_sum.RData")
+load("Data/Intermediate_datasets/Mexico_LST_day_sum.RData")
+load("Data/Intermediate_datasets/Mexico_LST_night_sum.RData")
+load("Data/Intermediate_datasets/Mexico_TCB_sum.RData")
+load("Data/Intermediate_datasets/Mexico_TCW_sum.RData")
+
+# remove 2015 values for LST and EVI due to anomalous values not supported by ground observations 
+# (annual trend still compensated due to future projection analysis)
+Mexico_EVI_sum <- Mexico_EVI_sum[, !grepl("2015", colnames(Mexico_EVI_sum))]
+Mexico_LST_day_sum <- Mexico_LST_day_sum[, !grepl("2015", colnames(Mexico_LST_day_sum))]
+Mexico_LST_night_sum <- Mexico_LST_night_sum[, !grepl("2015", colnames(Mexico_LST_night_sum))]
+
+# A) simple great circle distance for now
+load("Data/Intermediate_datasets/dist_mat_GC_Mexico.RData")
+# GC transformation (emphasises close places)
+dist_mat_GC = 1 / (dist_mat_GC + 1)
+  
+ # B) gravity model
+load("Data/Intermediate_datasets/Gravity_matrix_Mexico.RData")
+  
+# c) Radiation model
+load("Data/Intermediate_datasets/Radiation_matrix_Mexico.RData")
+  
+# D) Adjacency model
+load("Data/Intermediate_datasets/dist_mat_Adjacency_Mexico.RData")
+  
+# E) flight data
+load("Data/Intermediate_datasets/Mexico_air_move_mat_ad2.RData")
+  
+# F) Worldpop internal migration flows (state level)
+load("Data/Intermediate_datasets/Mexico_Migration_mat.RData")
+  
+# G) MAP friction surface- travel time between biggest cities in each municiaplity
+load("Data/Intermediate_datasets/Mexico_Friction_mat.RData")
+# Friction transformation (emphasises accessible places)
+dist_mat_Friction = 1 / (dist_mat_Friction + 1)
+
+# exclude self connections in all distance matrices
+diag(dist_mat_Adjacency) <- diag(dist_mat_Air) <- diag(dist_mat_Friction) <- NA
+diag(dist_mat_GC) <- diag(dist_mat_Grav) <- diag(dist_mat_Migration) <- diag(dist_mat_Rad) <- NA
+
+LST_day_m_FP <- read.csv("Data/Intermediate_datasets/Future_pred/MeanDayTemperature_Mexico.csv")
+LST_day_sd_FP <- read.csv("Data/Intermediate_datasets/Future_pred/SDDayTemperature_Mexico.csv")
+LST_night_m_FP <- read.csv("Data/Intermediate_datasets/Future_pred/MeanNightTemperature_Mexico.csv")
+LST_night_sd_FP <- read.csv("Data/Intermediate_datasets/Future_pred/SDNightTemperature_Mexico.csv")
+EVI_m_FP <- read.csv("Data/Intermediate_datasets/Future_pred/MeanEVI_Mexico.csv")
+EVI_sd_FP <- read.csv("Data/Intermediate_datasets/Future_pred/SDEVI_Mexico.csv")
+TCW_sd_FP <- read.csv("Data/Intermediate_datasets/Future_pred/SDTCW_Mexico.csv")
+
+#Load in functions
+source("/Users/eideobra/Dropbox/08_Serotype_spread/Denspread_code/ModellingSandbox/Fx_suitAssemble.R")
+source("/Users/eideobra/Dropbox/08_Serotype_spread/Denspread_code/ModellingSandbox/Fx_addCovariatesMex.R")
+source("/Users/eideobra/Dropbox/08_Serotype_spread/Denspread_code/ModellingSandbox/Fx_futureProjectionsMex.R")
+```
+
+```{r, Run future projections}
+startTime <- Sys.time()
+
+#Train outside the main function
+fittedWorkflow <-  xgb_pretuned_wflow %>% fit(data = spread_dat)
+
+initialConditions2019 <- spread_dat %>% dplyr::filter(Year_end == 2019) %>% dplyr::filter(Infected == 1) %>% dplyr::select(GAUL)
+numYearsToProject <- 20
+
+futureThresholds <- predictIncidence(Years = 2020:2039, Country = "Mexico", Current_year = 2019,
+                                     mod_sample = TRUE, mod_mode = "CV")
+medianThresholds <- futureThresholds[, "Incid"]
+lowerBoundThresholds <- futureThresholds[,"Incid_lower"]
+upperBoundThresholds <- futureThresholds[,"Incid_upper"]
+
+outputs_futureProjections <- futureProjections(fittedWorkflow = fittedWorkflow, 
+                                               country="Mexico", 
+                                               fullDataset = spread_dat,
+                                               thresholds = medianThresholds,
+                                               initialConditions = initialConditions2019, 
+                                               numYears = numYearsToProject,
+                                               regionLUT = regions_states_LUT)
+
+outputs_futureProjectionsLower <- futureProjections(fittedWorkflow = fittedWorkflow, 
+                                               country="Mexico", 
+                                               fullDataset = spread_dat,
+                                               thresholds = lowerBoundThresholds,
+                                               initialConditions = initialConditions2019, 
+                                               numYears = numYearsToProject,
+                                               regionLUT = regions_states_LUT)
+
+outputs_futureProjectionsUpper <- futureProjections(fittedWorkflow = fittedWorkflow, 
+                                               country="Mexico", 
+                                               fullDataset = spread_dat,
+                                               thresholds = upperBoundThresholds,
+                                               initialConditions = initialConditions2019, 
+                                               numYears = numYearsToProject,
+                                               regionLUT = regions_states_LUT)
+
+futureThresholds_XGB <- outputs_futureProjections[[1]]
+futureProjections_XGB <- outputs_futureProjections[[2]]
+futureProbabilities_XGB <- outputs_futureProjections[[3]]
+
+futureThresholds_XGBLower <- outputs_futureProjectionsLower[[1]]
+futureProjections_XGBLower <- outputs_futureProjectionsLower[[2]]
+futureProbabilities_XGBLower <- outputs_futureProjectionsLower[[3]]
+
+futureThresholds_XGBUpper <- outputs_futureProjectionsUpper[[1]]
+futureProjections_XGBUpper <- outputs_futureProjectionsUpper[[2]]
+futureProbabilities_XGBUpper <- outputs_futureProjectionsUpper[[3]]
+
+Sys.time() - startTime
+#Takes ~7  min 
+```
+
+```{r, Assign years of projections}
+#Add year indices into the list of dataframes returned
+start_year <- 2019
+for (yearIndex in (1:numYearsToProject)){
+  futureProjections_XGB[[yearIndex]] <- futureProjections_XGB[[yearIndex]] %>% mutate(PredictionYear=(start_year + yearIndex))
+  futureProjections_XGBLower[[yearIndex]] <- futureProjections_XGBLower[[yearIndex]] %>% mutate(PredictionYear=(start_year + yearIndex))
+  futureProjections_XGBUpper[[yearIndex]] <- futureProjections_XGBUpper[[yearIndex]] %>% mutate(PredictionYear=(start_year + yearIndex))
+}
+
+#Bind all the dataframes in the returned list into one
+joinedFutureProjections_XGB <- bind_rows(futureProjections_XGB)
+joinedFutureProjections_XGBLower <- bind_rows(futureProjections_XGBLower)
+joinedFutureProjections_XGBUpper <- bind_rows(futureProjections_XGBUpper)
+
+#Base case is the GAULs in initial conditions
+futurePredictionsYearInfected <- initialConditions2019 %>% mutate(YearInfected = start_year)
+futurePredictionsYearInfectedLower <- initialConditions2019 %>% mutate(YearInfected = start_year)
+futurePredictionsYearInfectedUpper <- initialConditions2019 %>% mutate(YearInfected = start_year)
+
+for (yearIndex in (1:numYearsToProject)){
+  if (yearIndex == 1){
+    infectedPriorYear <- futurePredictionsYearInfected %>% dplyr::select(GAUL)
+    infectedPriorYearLower <- futurePredictionsYearInfectedLower %>% dplyr::select(GAUL)
+    infectedPriorYearUpper <- futurePredictionsYearInfectedUpper %>% dplyr::select(GAUL)
+    
+    infectedThisYear <- joinedFutureProjections_XGB %>% dplyr::filter(PredictionYear==(start_year+yearIndex) & Infected == 1) %>% 
+                                                        dplyr::select(GAUL)
+    infectedThisYearLower <- joinedFutureProjections_XGBLower %>% dplyr::filter(PredictionYear==(start_year+yearIndex) & Infected == 1) %>% 
+                                                        dplyr::select(GAUL)
+    infectedThisYearUpper <- joinedFutureProjections_XGBUpper %>% dplyr::filter(PredictionYear==(start_year+yearIndex) & Infected == 1) %>% 
+                                                        dplyr::select(GAUL)
+  }else{
+    infectedPriorYear <- futurePredictionsYearInfected %>% dplyr::select(GAUL)
+    infectedPriorYearLower <- futurePredictionsYearInfectedLower %>% dplyr::select(GAUL)
+    infectedPriorYearUpper <- futurePredictionsYearInfectedUpper %>% dplyr::select(GAUL)
+    
+    infectedThisYear <- joinedFutureProjections_XGB %>% dplyr::filter(PredictionYear==(start_year+yearIndex) & Infected == 1) %>% 
+                                                        dplyr::select(GAUL)
+    infectedThisYearLower <- joinedFutureProjections_XGBLower %>% dplyr::filter(PredictionYear==(start_year+yearIndex) & Infected == 1) %>% 
+                                                        dplyr::select(GAUL)
+    infectedThisYearUpper <- joinedFutureProjections_XGBUpper %>% dplyr::filter(PredictionYear==(start_year+yearIndex) & Infected == 1) %>% 
+                                                        dplyr::select(GAUL)
+  }
+  
+  newlyInfectedGAULs <- dplyr::setdiff(infectedThisYear, infectedPriorYear) %>% mutate(YearInfected = (start_year+yearIndex))
+  newlyInfectedGAULsLower <- dplyr::setdiff(infectedThisYearLower, infectedPriorYearLower) %>% mutate(YearInfected = (start_year+yearIndex))
+  newlyInfectedGAULsUpper <- dplyr::setdiff(infectedThisYearUpper, infectedPriorYearUpper) %>% mutate(YearInfected = (start_year+yearIndex))
+  
+  #Assignment
+ futurePredictionsYearInfected <- rbind(futurePredictionsYearInfected, newlyInfectedGAULs)
+ futurePredictionsYearInfectedLower <- rbind(futurePredictionsYearInfectedLower, newlyInfectedGAULsLower)
+ futurePredictionsYearInfectedUpper <- rbind(futurePredictionsYearInfectedUpper, newlyInfectedGAULsUpper)
+}
+
+allGAULS <- admin2 %>% dplyr::select(GAUL_CODE) %>% st_drop_geometry() %>% rename(GAUL = GAUL_CODE) %>% mutate(GAUL=as.numeric(GAUL))
+futurePredictionsYearInfected <- left_join(allGAULS, futurePredictionsYearInfected, by="GAUL")
+futurePredictionsYearInfected <- left_join(futurePredictionsYearInfected, futurePredictionsYearInfectedLower, by="GAUL")
+futurePredictionsYearInfected <- left_join(futurePredictionsYearInfected, futurePredictionsYearInfectedUpper, by="GAUL")
+names(futurePredictionsYearInfected)[2:4] = c("YearInfected", "YearInfectedLower", "YearInfectedUpper")
+
+futurePredictionsYearInfectedSpatial <- merge(admin2, futurePredictionsYearInfected, by.x="GAUL_CODE", by.y="GAUL")
+```
+
+```{r, Plot projections as a map}
+palette_FutureProj <- brewer.pal(n = 5, name = "YlOrRd")
+palette_FutureProj <- c("#FFFFFF", palette_FutureProj)
+
+if (numYearsToProject == 5){
+  breaks_futureProj <- c(2019, 2020, 2021, 2022, 2023, 2024, 2025)
+  labels_futureProj <- c("Before 2020", "2020", "2021", "2022","2023", "2024")
+  textNA_futureProj <- "Dengue not predicted as of 2024"
+}else if (numYearsToProject == 10){
+  breaks_futureProj <- c(2019, 2020, 2022, 2024, 2026, 2028, 2029)
+  labels_futureProj <- c("Before 2020", "2020-2022", "2022-2024", "2024-2026","2026-2028", "2028-2029")
+  textNA_futureProj <- "Dengue not predicted as of 2029"
+}else if (numYearsToProject == 15){
+  breaks_futureProj <- c(2019, 2020, 2023, 2026, 2029, 2032, 2034)
+  labels_futureProj <- c("Before 2020", "2020-2023", "2023-2026", "2026-2029","2029-2032", "2032-2034")
+  textNA_futureProj <- "Dengue not predicted as of 2034"
+}else if(numYearsToProject == 20){
+  breaks_futureProj <- c(2019, 2020, 2024, 2028, 2032, 2036, 2039)
+  labels_futureProj <- c("Before 2020", "2020-2024", "2024-2028", "2028-2032","2032-2036", "2036-2039")
+  textNA_futureProj <- "Dengue not predicted as of 2039"
+}
+
+tm_shape(futurePredictionsYearInfectedSpatial) +
+tm_polygons(border.col = "black")+
+tm_shape(futurePredictionsYearInfectedSpatial) +
+tm_fill("YearInfected", palette=palette_FutureProj, title = "Predicted invasion year",
+        breaks= breaks_futureProj, labels=labels_futureProj, textNA = textNA_futureProj) +
+tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.fontface = "bold",
+          legend.format=list(fun=function(x) formatC(x, digits=0, format="d")))
+
+
+```
+
+```{r, Examine probabilities of newly invaded GAULs over time}
+#Add year indices into the list of dataframes returned
+start_year <- 2019
+for (yearIndex in (1:numYearsToProject)){
+  futureProbabilities_XGB[[yearIndex]] <- futureProbabilities_XGB[[yearIndex]] %>% mutate(PredictionYear=(start_year + yearIndex))
+}
+futureProbabilities_XGB <- bind_rows(futureProbabilities_XGB)
+
+futureProbabilities_XGB$Region = ""
+for(i in 1:nrow(futureProbabilities_XGB)){
+  municipality_GAUL <- futureProbabilities_XGB$GAUL[i]
+  admin2_index <- match(municipality_GAUL, admin2$GAUL_CODE)
+  state_name <- admin2[admin2_index,]$ADM1_ES
+  region_name <- unname(getRegion[state_name])
+  futureProbabilities_XGB$Region[i] <- region_name
+}
+
+futureProbabilities_XGB %>% 
+  ggplot(aes(x=as.factor(PredictionYear), y=.pred_1))+
+        ggbeeswarm::geom_quasirandom()
+
+futureProbabilities_XGB %>% 
+  ggplot(aes(x=as.factor(PredictionYear), y=.pred_1))+
+        ggbeeswarm::geom_quasirandom(aes(color=Region))+
+        theme(legend.position = "bottom")
+```
+
+```{r, Bar graph with number of invaded GAULs from 2000-2040}
+start_year <- 1996
+gtYearInfected <- spread_dat %>% dplyr::filter(Year_end == 1997) %>% 
+                                 dplyr::filter(GAUL %in% initialConditions$GAUL_CODE) %>% 
+                                 dplyr::select(GAUL) %>% 
+                                 mutate(YearInfected = start_year)  
+#Figure out which GAULs are newly infected each year
+for (yearIndex in (1:23)){
+  if (yearIndex == 1){
+    infectedPriorYear <- gtYearInfected %>% dplyr::select(GAUL)
+    infectedThisYear <- spread_dat %>% dplyr::filter(Year_end==(start_year+yearIndex) & Infected == 1) %>% dplyr::select(GAUL)
+  }else{
+    infectedPriorYear <- spread_dat %>% dplyr::filter(Year_end==(start_year+yearIndex-1) & Infected == 1) %>% dplyr::select(GAUL) 
+    infectedThisYear <- spread_dat %>% dplyr::filter(Year_end==(start_year+yearIndex) & Infected == 1) %>% dplyr::select(GAUL)
+  }
+  
+  newlyInfectedGAULs <- dplyr::setdiff(infectedThisYear, infectedPriorYear) %>% mutate(YearInfected = (start_year+yearIndex))
+  
+  #Assignment
+  gtYearInfected <- rbind(gtYearInfected, newlyInfectedGAULs)
+}
+
+#Add in the GAULs that never become infected as NA
+neverInfectedGAULS <- spread_dat %>% dplyr::filter(Year_end==2019) %>% dplyr::filter(Infected==0) %>% dplyr::select(GAUL) %>% mutate(YearInfected = NA)
+gtYearInfected <- rbind(gtYearInfected, neverInfectedGAULS)
+
+infected2000to2039 <- rbind(futurePredictionsYearInfected[, 1:2] %>% dplyr::filter(YearInfected > 2019), 
+                            gtYearInfected %>% dplyr::filter(!is.na(YearInfected))) %>%
+                      mutate(TimeSeries = case_when(YearInfected <2020 ~ "Contemporary Spread",
+                                                    YearInfected > 2019 ~ "Future Projection"))
+
+muns_year <- table(infected2000to2039$YearInfected)
+muns_year <- data.frame(Year = as.numeric(names(muns_year)),
+                        Municipalities = cumsum(muns_year)) %>%
+             mutate(TimeSeries = case_when(Year < 2020 ~ "Contemporary Spread",
+                                           Year > 2019 ~ "Future Projection"))
+
+muns_year %>% ggplot(aes(x = Year, y = Municipalities, fill=TimeSeries)) + 
+                       geom_bar(stat="identity", colour="black")+theme_bw() +
+                       scale_y_continuous(name = "Cumulative municipalities", limits = c(0, nrow(admin2))) +
+                       theme(axis.title.x = element_text( face = "bold"),
+                             axis.title.y = element_text( face = "bold"),
+                             legend.position = "bottom")+
+                       labs(fill="Time Period")+
+                       ylab("Cumulative municipalities")+
+                       scale_fill_manual(values=c("Contemporary Spread"="white",
+                                                  "Future Projection"="firebrick"))
+```
+
+```{r, Determine the 10 largest future infected municipalities}
+Mexico_Population <- read.csv("/Users/eideobra/Dropbox/08_Serotype_spread/Data/Population/Mexico_pop.csv") %>% 
+                     dplyr::select(GAUL_CODE, Pop) %>% 
+                     rename(GAUL=GAUL_CODE)
+
+futurePredictionsYearInfected <- base::merge(futurePredictionsYearInfected, Mexico_Population)
+
+top10FutureInfectedGAULs <- futurePredictionsYearInfected %>% dplyr::filter(YearInfected > 2019) %>% 
+                                                              arrange(desc(Pop)) %>% 
+                                                              slice_max(Pop, n=10) %>% 
+                                                              dplyr::select(-c(Pop))
+
+outputs_futureProjections_wBigCities <- futureProjections(fittedWorkflow = fittedWorkflow, 
+                                                          country="Mexico", 
+                                                          fullDataset = spread_dat,
+                                                          thresholds = medianThresholds,
+                                                          initialConditions = initialConditions2019, 
+                                                          numYears = numYearsToProject,
+                                                          big_cities = top10FutureInfectedGAULs,
+                                                          regionLUT = regions_states_LUT)
+
+bigCityMobilityMatrices <- outputs_futureProjections_wBigCities[[4]] %>% discard(is.null)
+```
+
+Generate megamap:\~\~\~\~\~\~\~\~\~\~\~\~\~\~
+
+```{r, All years combined}
+# Combine predictions from mTSCV and future projections together
+megamap_currentGAULs <- joinedBinned %>% dplyr::select(GAUL, YearPredicted) %>% 
+                                         rename(CurrentlyInfected=YearPredicted) 
+
+megamap_futureGAULs <- futurePredictionsYearInfected %>% dplyr::filter(YearInfected > 2019) %>%
+                                                         rename(FutureInfected=YearInfected) 
+
+megamap_allGAULs <- sp::merge(megamap_currentGAULs, megamap_futureGAULs, by="GAUL", all.x=T) %>%
+                        mutate(YearInfected = coalesce(CurrentlyInfected, FutureInfected))
+
+megamap_spatial <- merge(admin2, megamap_allGAULs, by.x="GAUL_CODE", by.y="GAUL", all.x=TRUE)
+
+#Plot megamap
+palette_megamap <- brewer.pal(n = 9, name = "YlOrRd")
+palette_megamap <- c("#FFFFFF", palette_megamap)
+
+breaks_megamap <- c(1996, 2000, 2005, 2010, 2015, 2020, 2025, 2030, 2035, 2039)
+labels_megamap <- c("1996-2000", "2000-2005", "2005-2010", "2010-2015","2015-2020", "2020-2025", "2025-2030","2030-2035","2035-2039")
+textNA_megamap <- "Dengue not predicted as of 2039"
+
+tm_shape(megamap_spatial) +
+tm_polygons(border.col = "black")+
+tm_shape(megamap_spatial) +
+tm_fill("YearInfected", palette=palette_megamap, title = "Predicted invasion year",
+        breaks= breaks_megamap, labels=labels_megamap, textNA = textNA_megamap, showNA = TRUE) +
+tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.fontface = "bold",
+          legend.format=list(fun=function(x) formatC(x, digits=0, format="d")))
+```
+
+```{r, Plot each year on a different map}
+start_time <- Sys.time()
+textNA_yearOverYearMegamap <- "Dengue not predicted as of current year"
+
+for (yearIndex in 1996:2039){
+  yearOverYearMegamap_allGAULs <- megamap_allGAULs %>% dplyr::select(GAUL, YearInfected) %>%
+                                                       mutate(currentlyInfected = case_when(YearInfected<=yearIndex ~ "Invaded",
+                                                                                            TRUE ~ "Uninvaded"))
+  
+  yearOverYearMegamap_spatial <- merge(admin2, yearOverYearMegamap_allGAULs, by.x="GAUL_CODE", by.y="GAUL", all.x=TRUE)
+  
+  yearOverYearMegamap <- tm_shape(yearOverYearMegamap_spatial) +
+                         tm_polygons(border.col = "black")+
+                         tm_shape(yearOverYearMegamap_spatial) +
+                         tm_fill("currentlyInfected", title = paste("Invaded GAULs as of", yearIndex), palette = c("red", "grey")) +
+                         tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.fontface = "bold")
+  
+  yearOverYearMegamap_filename <- paste("/Users/vinyas/Desktop/Mexico-megamapYOY_", yearIndex,".jpg", sep="")
+  tmap_save(yearOverYearMegamap, yearOverYearMegamap_filename)
+}
+end_time <- Sys.time()
+end_time - start_time
+
+#Takes ~3.8 hours to save all 44 maps to disk on the Mac Studio... this is much too slow to be practical - need to look into simplifying map plotting
+```
+
+Save files for Oli:\~\~\~\~\~\~\~\~\~\~\~\~\~
+
+```{r, Write to desktop}
+#mTSCV of contemporary spread (Fig 1)
+write.csv(joined, "/Users/eideobra/Dropbox/08_Serotype_spread/Predictions/Mex-Fig1-ContemporaryPredsJan24.csv")
+
+#Future predictions (Fig 3) and wargames (Fig 4)
+write.csv(futurePredictionsYearInfected,"/Users/eideobra/Dropbox/08_Serotype_spread/Predictions/Mex-Fig3-FuturePredsJan24.csv")
+write.csv(top10FutureInfectedGAULs, "/Users/eideobra/Dropbox/08_Serotype_spread/Predictions/Mex-Fig4-Top10FutureInfected-GAULsJan24.csv")
+save(bigCityMobilityMatrices, file = "/Users/eideobra/Dropbox/08_Serotype_spread/Predictions/Mex-Fig4-Top10FutureInfected-MobMatricesJan24.RData")
+
+```
+
+\`\`\`

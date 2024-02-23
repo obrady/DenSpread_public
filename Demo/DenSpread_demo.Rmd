@@ -1,0 +1,331 @@
+---
+title: "DenSpread Demo"
+author: "Oliver Brady"
+date: '2024-02-23'
+output: html_document
+---
+Prior to running this script. Set up a file directory containing:
+1) this Rmarkdown file
+2) all data files downloaded from the [Figshare repository] (https://doi.org/10.6084/m9.figshare.22047905.v2)
+3) The functions from the `PaperCode/Model_fitting/Functions` folder in the [DenSpread_public Github repository](https://github.com/obrady/DenSpread_public)
+4) The files from the `Data/Intermediate_datasets/Future_pred` folder in the [DenSpread_public Github repository](https://github.com/obrady/DenSpread_public)
+```{r setup, include=TRUE}
+
+
+# packages
+library(dplyr)
+library(tidymodels)
+library(sf)
+library(survival)
+library(flexsurv)
+library(ggplot2)
+library(tmap)
+
+
+#Load in helper functions
+source("Fx_suitAssembleAssemble.R")
+source("Fx_addCovariatesAssemble.R")
+source("Fx_SurvModWrap.R")
+source("Fx_timeseriesCV_mediumBra.R")
+source("Fx_minimizeClassificationDistMTSCV.R")
+source("Fx_computePerformanceMetricsMTSCV.R")
+
+```
+
+## Prepare data
+
+Load in covariate data
+```{r Covariate_Data_load}
+# climate data
+load("Brazil_Aegypti_sum.RData")
+load("Brazil_EVI_sum.RData")
+load("Brazil_LandCover_sum.RData")
+load("Brazil_LST_day_sum.RData")
+load("Brazil_LST_night_sum.RData")
+load("Brazil_TCB_sum.RData")
+load("Brazil_TCW_sum.RData")
+
+# human movement data
+load("dist_mat_GC_Brazil.RData")
+load("Gravity_matrix_Brazil.RData")
+load("Radiation_matrix_Brazil.RData")
+load("dist_mat_Adjacency_Brazil.RData")
+load("Brazil_air_move_mat_ad2.RData") # flight data
+load("Brazil_Migration_mat.RData")
+load("Brazil_Friction_mat.RData")
+
+# Transformations for Friction and GC so higher values indicate more accessible places
+dist_mat_GC = 1 / (dist_mat_GC + 1)
+dist_mat_Friction = 1 / (dist_mat_Friction + 1)
+
+# exclude self connections in all distance matrices
+diag(dist_mat_Adjacency) <- diag(dist_mat_Air) <- diag(dist_mat_Friction) <- NA
+diag(dist_mat_GC) <- diag(dist_mat_Grav) <- diag(dist_mat_Migration) <- diag(dist_mat_Rad) <- NA
+
+# renaming covariates to be country non-specific
+Aegypti_sum = Brazil_Aegypti_sum
+EVI_sum = Brazil_EVI_sum
+LandCover_sum = Brazil_LandCover_sum
+LST_day_sum = Brazil_LST_day_sum
+LST_night_sum = Brazil_LST_night_sum
+TCB_sum = Brazil_TCB_sum
+TCW_sum = Brazil_TCW_sum
+
+# Annual multipliers to increase or decrease climate and movement variables for each year
+  LST_day_m_FP <- read.csv("MeanDayTemperature_Brazil.csv")
+  LST_day_sd_FP <- read.csv("SDDayTemperature_Brazil.csv")
+  LST_night_m_FP <- read.csv("MeanNightTemperature_Brazil.csv")
+  LST_night_sd_FP <- read.csv("SDNightTemperature_Brazil.csv")
+  EVI_m_FP <- read.csv("MeanEVI_Brazil.csv")
+  EVI_sd_FP <- read.csv("SDEVI_Brazil.csv")
+  TCW_sd_FP <- read.csv("SDTCW_Brazil.csv")
+  Movement_FP <- read.csv("Movement_Brazil.csv")
+
+```
+
+Load in a 2nd Administrative unity (municipality) shapefile
+```{r shaprefile load}
+admin2 <- read_sf("Admin2_shapefile.shp")
+admin2 <- filter(admin2, COUNTRY_ID == "BRA")
+```
+
+Load in dengue data for Brazil and inspect. Each row is a 2nd administrative unit municipality and the key column for this analysis is 'year' which defines the year in which dengue first arrived in the respective municipality
+```{r load dengue data}
+dat <- read.csv("Brazil_mun_dat_cleaned_thresholded.csv")
+head(dat)
+```
+
+First we have to process the data into a list where each item corresponds to a successive year. Within each item (year) will be a dataset that identifies which municipalities have and have not been infected. Because the values of the connectivity covariates depend on which municipalities are infected each year, these have to be re-calculated each year which happens within the `add.Covariates()` function. Note that this will take 1-2 minutes to run on a average machine
+```{r dengue data process}
+# year to year spread dataset
+spread_dat <- list()
+
+# pre-extablish the range of years to compile
+year_range <- min(dat$year):max(dat$year)
+
+## loop through each successive year timestep and assemble:
+# 1) areas infected in year i
+# 2) areas infected and areas not infected by year (i + 1)
+# 3) covariates linking 1 and 2
+
+
+for(i in 1:(length(year_range) - 1)){
+  # load up data for areas infected now and infected in next years
+  fit_dat_now <- dat[dat$year <= year_range[i], ]
+  fit_dat_next <- dat[dat$year <= year_range[(i + 1)], ]
+  
+  # define infected and non-infected areas
+  # now
+  infected <- admin2$GAUL_CODE[admin2$GAUL_CODE %in% fit_dat_now$GAUL_A2]
+  vulnerable <- admin2$GAUL_CODE[!(admin2$GAUL_CODE %in% fit_dat_now$GAUL_A2)]
+  
+  # next
+  vulnerable_infected_next <- admin2$GAUL_CODE[admin2$GAUL_CODE %in% fit_dat_next$GAUL_A2]
+  vulnerable_NOT_infected_next = vulnerable[!(vulnerable %in% vulnerable_infected_next)]
+  
+  # assemble fitting dataset response variable
+  model_fit_dat <- data.frame(GAUL = c(vulnerable_infected_next, 
+                                       vulnerable_NOT_infected_next),
+                              Infected = c(rep(1, length(vulnerable_infected_next)),
+                                           rep(0, length(vulnerable_NOT_infected_next))))
+  # sort so GAULs are in the same order as in the admin2 shapefile
+  model_fit_dat$order = match(model_fit_dat$GAUL, admin2$GAUL_CODE)
+  model_fit_dat = model_fit_dat[order(model_fit_dat$order), ]
+  model_fit_dat = model_fit_dat[, 1:2]
+  
+  
+  ## add covariates
+  cov_finder <- add.Covariates(GAULS_SOURCE = infected,
+                               GAULS_DEST = model_fit_dat$GAUL,
+                               spreadYear = year_range[i])
+  model_fit_dat = data.frame(model_fit_dat,
+                             cov_finder$rtn_df,
+                             Year_end = year_range[(i + 1)])
+  
+  ## saving datasets to lists
+  spread_dat[[i]] = model_fit_dat
+}
+# add names to the data lists
+names(spread_dat) <- year_range[1:(length(year_range) - 1)] + 1
+```
+
+## Fit the temporal survival model
+
+We use the `surv.mod.wrap()` function to fit a range of survival models to national counts of invaded municipalities. To do this we also need to specify an initial invasion date (i.e. a rough estiamte of when the first municipality was invaded). This function returns a list of length 2 with the first item comparing the fit of the different survival models and the second item containing a further list of each of the model objects. Note that in the paper this is implemented using a time series cross validation approach, but here(for simplicity) we will just fit to all years of data.
+```{r fit and predict from survival models}
+# estimate of invasion date
+invasion_date = 1983
+surv_mod_candidates <- surv.mod.wrap(dat)
+# for this case select the model with the lowest AIC
+surv_mod <- surv_mod_candidates[[2]][[which.min(surv_mod_candidates[[1]]$AICs)]]
+
+# predict incidence between invasion date and 2040
+# use a small helper function to calculate annual incidence from annual counts
+incid.find <- function(x){
+  # calculate eligible at t - 1
+  eligible = c(1, x[1:(length(x) - 1)])
+  # infected
+  infected = eligible - x
+  # incidence
+  incidence = infected / eligible
+  # correct cases wehre 0 eligible
+  incidence[!is.finite(incidence)] = 1
+  return(incidence)
+}
+
+Surv_preds = predict(surv_mod, 
+                       type = "survival",
+                       newdata = data.frame(1),
+                       times = 0:(2040 - invasion_date), 
+                       conf.int = T)
+  
+Surv_preds = Surv_preds$.pred[[1]]
+  
+IncidMod_pred <- data.frame(Year = invasion_date:2040,
+                            Incid = incid.find(Surv_preds$.pred_survival),
+                            Incid_upper = incid.find(Surv_preds$.pred_upper),
+                            Incid_lower = incid.find(Surv_preds$.pred_lower))
+
+# visualise the incidence of municipality invasion over time
+ggplot(aes(x = Year, y = Incid), data = IncidMod_pred) +
+  geom_line()
+
+```
+
+
+## Fit the geospatial model
+
+Here we specify an XGB Boost model within the `tidymodels` package format which involves binding a dataset recipe where we specify the data, response variable and covariates and parameters for the model fitting. In the paper we run a search grid over a range of hyperparameters for the XGBoost model. Here we just include the most optimal hyperparameters, but this can be edited if desired.
+```{r XG_Boost_model_fitting}
+# to estimate performance metrics during model fit we need to add an additional column to the dataset to denote whether the municipality is test eligible or not (TestElig). Municipalities that are already infected at the start of the year will automatically be infected by the end of the year so will not be test eligible
+for(i in 1:length(spread_dat)){
+  spread_dat[[i]]$TestElig = 1
+  
+  if(i == 1){
+    spread_dat[[i]]$TestElig[spread_dat[[i]]$GAUL %in% initialConditions] = 0
+  }else{
+    inf_prev_year <- spread_dat[[(i - 1)]]$GAUL[spread_dat[[(i - 1)]]$Infected == 1]
+    spread_dat[[i]]$TestElig[spread_dat[[i]]$GAUL %in% inf_prev_year] = 0
+  }
+}
+
+# bind together the spread_dat list (list of municipality invasion status and covariates year-by-year) into one big data frame
+spread_dat_large <- bind_rows(spread_dat)
+spread_dat_large$Infected = as.factor(spread_dat_large$Infected)
+
+xgb_rec <- recipe(Infected ~ ., data = spread_dat_large) %>%
+             update_role(ae_suit, TCW_mean, LOGimport_pres_Grav,LOGimport_pres_GC,
+                         Year_end,GAUL, TestElig, new_role = "ID") %>% 
+             step_normalize(LST_day_mean,LST_day_stdDev,LST_night_mean,LST_night_stdDev,TCW_stdDev,
+                            EVI_mean,EVI_stdDev,Landcover,TCB_mean,TCB_stdDev,
+                            LOGimport_pres_Fric,LOGimport_pres_Rad,import_pres_Adjacency, LOGimport_pres_Air,LOGimport_pres_Mig) 
+
+
+#Specify an XGBoost model with previously tuned hyperparameters
+xgb_spec_pretuned <- boost_tree(mtry = 15,
+                                min_n = 3, 
+                                tree_depth = 15, 
+                                learn_rate = 0.0302302539454393, 
+                                loss_reduction = 	0.0579349229467861, 
+                                trees = 1495,
+                                sample_size = 0.882471508998424,
+                                stop_iter = 18) %>%
+                     set_engine("xgboost") %>% 
+                     set_mode("classification")
+
+#Workflows combine model specifications and dataset recipes
+xgb_pretuned_wflow <- workflow() %>% 
+                      add_recipe(xgb_rec) %>% 
+                      add_model(xgb_spec_pretuned)
+```
+
+We also need to establish the initial conditions for the model- ie which muncipalities were invaded at the start of the time series (by the end of 2001 in this case)
+```{r initial conditions}
+initialConditions <- dat %>% dplyr::filter( Year == 2001) %>% dplyr::select(GAUL)
+```
+
+We also need to extrct predictions from the temporal survival model which tells us how many municipalities will be infected each year
+```{r thresholds}
+# loop through each year and pre-compute thresholds based on the survival models
+thresholds_mTSCV <- list()
+for(k in 2002:2019){
+  YearIncid <- IncidMod_pred$Incid[IncidMod_pred$Year == k]
+  thresholds_mTSCV = c(thresholds_mTSCV, YearIncid)
+}
+thresholds_mTSCV = unlist(thresholds_mTSCV)
+```
+
+
+Now we can fit the geospatial XGBoost model and make predictions year-by-year given which municipalities we know were invaded by the end of 2001. This takes around 20 minutes on a normal computer using the below approach
+```{r geospatial Model_fit}
+#Model fitting done within the timeseriesCV function
+
+# load new versions of addCovariates and suitAssemble - minor changes to variable names
+# specific for each country
+source("Fx_suitAssemble.R")
+source("Fx_addCovariatesBra.R")
+
+# we include a region <-> states lookup table for summarising predictive performance at the regional level
+
+regions_states_LUT = data.frame(stringsAsFactors = FALSE, 
+                                State=c("Acre", "Alagoas", "Amapa", "Amazonas", "Bahia", "Ceara", "Distrito Federal", "Espirito Santo","Goias","Maranhao","Mato Grosso","Mato Grosso Do Sul",
+                                        "Minas Gerais", "Para","Paraiba","Parana","Pernambuco","Piaui", "Rio De Janeiro","Rio Grande Do Norte","Rio Grande Do Sul","Rondonia","Roraima",
+                                        "Santa Catarina","Sao Paulo", "Sergipe", "Tocantins"),
+                                Region = c("North","Northeast","North", "North", "Northeast", "Northeast", "CentralWest", "Southeast","CentralWest","Northeast",
+                                           "CentralWest","CentralWest","Southeast", "North", "Northeast", "South", "Northeast", "Northeast", "Southeast", "Northeast", "South", "North",
+                                           "North","South","Southeast", "Northeast","North"))
+
+
+# fit the XG Boost models (run time ~ 20 minutes)
+outputs_medTSCV <- timeseriesCV_mediumBra(xgb_pretuned_wflow, spread_dat_large, initialConditions, numYears=18, thresholds=thresholds_mTSCV, regions_states_LUT)
+
+# extract the model fit metrics and predictions
+metrics_XGB_medTSCV <- outputs_medTSCV[[1]]
+predictions_XGB_medTSCV <- outputs_medTSCV[[2]]
+probabilities_XGB_medTSCV <- outputs_medTSCV[[3]]
+```
+
+
+Now we can plot the predictions from the model as a map
+```{r plotting predictions}
+# first we need to do some processing to link the predictions back to the ground truth (observation) data and link back to the shapefile.
+
+#Add year indices into the list of dataframes returned
+start_year <- 2001
+for (yearIndex in (1:18)){
+  predictions_XGB_medTSCV[[yearIndex]] <- predictions_XGB_medTSCV[[yearIndex]] %>% mutate(PredictionYear=(start_year + yearIndex))
+}
+
+#Bind all the dataframes in the returned list into one
+joinedPredictions_XGB_medTSCV <- bind_rows(predictions_XGB_medTSCV)
+
+# find the year in which each municipality was first infected
+pred_Inv <- aggregate(PredictionYear ~ GAUL,
+                      data = joinedPredictions_XGB_medTSCV[joinedPredictions_XGB_medTSCV$Infected == 1, ],
+                      FUN = min)
+
+# add back in the areas infected already by the end of 2001
+pred_Inv = rbind(pred_Inv, data.frame(GAUL = initialConditions$GAUL, PredictionYear = 2001))
+
+# add these results to the shapefile
+admin2$pred_Inv = NA
+admin2$pred_Inv[match(pred_Inv$GAUL, admin2$GAUL_CODE)] = pred_Inv$PredictionYear
+
+# final plotting code
+map_preds <- tm_shape(admin2) +
+             tm_polygons(border.col = "black")+ 
+             tm_shape(admin2) +
+             tm_fill("pred_Inv", palette="YlOrRd", title = "Year of predicted invasion",
+                     breaks= c(2000, 2002, 2004, 2006, 2008, 2010, 2012, 2014, 2016, 2018,2020),
+                     textNA = "Dengue not predicted as of 2020")+
+             tm_layout(frame = FALSE, legend.outside = TRUE, legend.title.fontface = "bold",
+                       legend.format=list(fun=function(x) formatC(x, digits=0, format="d")))
+
+map_preds
+```
+
+
+
+
+
+

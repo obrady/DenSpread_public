@@ -2,7 +2,16 @@
 Code to accompany the paper "Human movement and environmental barriers shape the emergence of dengue”
 This repository contains data, code and results from the paper. Users looking to refit the models will need to also download the environmental and human movement covariate matrices from the following Figshare repository: 10.6084/m9.figshare.22047905 
 
-## Higher level folder structure
+
+## System requirements
+This code was developed and implemented using R version 4.0.1 and RStudio version 2022.12.0 using macOS version 14.3.1 (Sonoma). This code requires only a standard computer with enough RAM to support the scale of analysis needed. Once R, RStudio and relevant R packages have been installed, no further installation operations are required.
+
+
+## Instructions for use
+The repository is organised into the following structure:
+
+### Demo folder
+Containes a demonstration of fitting and predicting from the spread model using data from Brazil
 
 ### Data folder
 Contains cleaned and thresholded dengue datasets for Mexico and Brazil. See cited sources for original datasets. This folder also contains several intermediate datasets and population data that is used at various stages of the analysis to adjust covariates or extract summaries from the datasets
@@ -24,3 +33,7 @@ Contains one script to process the dengue data into a list of invaded municipali
 
 #### Plots
 Containes scripts to create the main figures of the paper
+
+
+
+

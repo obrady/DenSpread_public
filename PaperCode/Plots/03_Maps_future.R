@@ -81,6 +81,15 @@ map_preds_bra <- tm_shape(admin0, bbox = extent(admin2_bra)) +
 tmap_save(map_preds, filename = "Plots/Jan24/Mex_Future.png")
 tmap_save(map_preds_bra, filename = "Plots/Jan24/Bra_Future.png")
 
+# save source data
+write.csv(as.data.frame(admin2)[, c("ADM2_ES", "ADM2_PCODE", "GAUL_CODE", 
+                                    "Year")], 
+          file = "Figure_source_data/SD_Fig_7A.csv")
+write.csv(as.data.frame(admin2_bra)[, c("NAME", "GAUL_CODE", 
+                                        "Year")], 
+          file = "Figure_source_data/SD_Fig_7C.csv")
+
+
 
 # load in historical predictions (Brazil only)
 D2 <- read.csv("Predictions/Bra-Fig2-S6-RioFortManJan24.csv")
@@ -176,6 +185,8 @@ p1 <- ggplot(bra_RS, aes(fill=Region, y=Cum_count_mid, x=Year)) +
 
 ggsave(p1, filename = "Plots/Jan24/Futurecase_histo_bra.png", height = 3, width = 6)
 
+# save source data
+write.csv(bra_RS, file = "Figure_source_data/SD_Fig_7D.csv")
 
 
 
@@ -243,6 +254,9 @@ p2 <- ggplot(mex_RS, aes(fill=Elevation, y=Cum_count_mid, x=Year)) +
 p2
 
 ggsave(p2, filename = "Plots/Jan24/Futurecase_histo_mex.png", height = 3, width = 6)
+
+# save source data
+write.csv(mex_RS, file = "Figure_source_data/SD_Fig_7B.csv")
 
 
 

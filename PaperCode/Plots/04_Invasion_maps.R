@@ -25,7 +25,7 @@ library(igraph)
 setwd("/Users/eideobra/Dropbox/08_Serotype_spread/")
 # setwd("/Users/Vinyas/OneDrive/08_Serotype_spread/")
 
-country <- "Mexico"
+country <- "Brazil"
 
 # admin files
 if(country == "Brazil"){
@@ -427,6 +427,31 @@ for(i in 1:length(top10s)){
   # saving
   p_filename <- paste0("Plots/Jan24/Source_type_", city_dets$NAME, ".png")
   ggsave(filename = p_filename, g1)
+  
+  # source data saving
+  if(country == "Mexico"){
+    invaded <- as.data.frame(invaded)[, c("ADM2_ES", "ADM2_PCODE", "GAUL_CODE")]
+    invaded$Source_type = "Other"
+    sources = as.data.frame(sources)[, c("ADM2_ES", "ADM2_PCODE", "GAUL_CODE", "Source_type")]
+    invaded = invaded[!(invaded$GAUL_CODE %in% sources$GAUL_CODE), ]
+    all_sources = rbind(invaded, sources)
+  }else{
+    invaded <- as.data.frame(invaded)[, c("NAME", "GAUL_CODE")]
+    invaded$Source_type = "Other"
+    sources = as.data.frame(sources)[, c("NAME", "GAUL_CODE", "Source_type")]
+    invaded = invaded[!(invaded$GAUL_CODE %in% sources$GAUL_CODE), ]
+    all_sources = rbind(invaded, sources)
+  }
+  
+  if(city_dets$NAME == "Brasilia"){write.csv(all_sources, file = "Figure_source_data/SD_Fig_4A.csv")}
+  if(city_dets$NAME == "Sao Paulo"){write.csv(all_sources, file = "Figure_source_data/SD_Fig_4B.csv")}
+  if(city_dets$NAME == "Porto Alegre"){write.csv(all_sources, file = "Figure_source_data/SD_Fig_4C.csv")}
+  if(city_dets$NAME == "Curitiba"){write.csv(all_sources, file = "Figure_source_data/SD_Fig_4D.csv")}
+  
+  if(city_dets$NAME == "Monterrey"){write.csv(all_sources, file = "Figure_source_data/SD_Fig_5A.csv")}
+  if(city_dets$NAME == "Zapopan"){write.csv(all_sources, file = "Figure_source_data/SD_Fig_5B.csv")}
+  if(city_dets$NAME == "Tijuana"){write.csv(all_sources, file = "Figure_source_data/SD_Fig_5C.csv")}
+  if(city_dets$NAME == "Nezahualcóyotl"){write.csv(all_sources, file = "Figure_source_data/SD_Fig_5D.csv")}
 }
 
 

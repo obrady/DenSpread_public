@@ -81,6 +81,15 @@ map_obs_bra <- tm_shape(admin0, bbox = extent(admin2_bra)) +
 tmap_save(map_obs, filename = "Plots/Jan24/Mex_contemporary_observed.png")
 tmap_save(map_obs_bra, filename = "Plots/Jan24/Bra_contemporary_observed.png")
 
+# save source data
+write.csv(as.data.frame(admin2)[, c("ADM2_ES", "ADM2_PCODE", "GAUL_CODE", 
+                                    "YearObserved", "YearPredicted")], 
+          file = "Figure_source_data/SD_Fig_1A_2A.csv")
+write.csv(as.data.frame(admin2_bra)[, c("NAME", "GAUL_CODE", 
+                                    "YearObserved", "YearPredicted")], 
+          file = "Figure_source_data/SD_Fig_1C_2D.csv")
+
+
 # 01b histograms of cumulative invaded municipalities
 cum_inv_mex = table(dat_mex$Year)
 cum_inv_bra = table(dat_bra$Year)
@@ -109,6 +118,10 @@ p2
 
 ggsave(filename = "Plots/Jan24/Cumulative_muns_infected_Brazil.png", height = 3, width = 4, p1)
 ggsave(filename = "Plots/Jan24/Cumulative_muns_infected_Mexico.png", height = 3, width = 4, p2)
+
+# save source data
+write_csv(cum_inv_mex, file = "Figure_source_data/SD_Fig_1B.csv")
+write_csv(cum_inv_bra, file = "Figure_source_data/SD_Fig_1D.csv")
 
 
 # 01 raw predictions
@@ -269,6 +282,10 @@ map_preds2_bra <- tm_shape(admin0, bbox = extent(approxras_bra)) +
 tmap_save(map_preds2, filename = "Plots/Jan24/Mex_contemporary_smooth.png")
 tmap_save(map_preds2_bra, filename = "Plots/Jan24/Bra_contemporary_smooth.png")
 
+# save source data
+writeRaster(approxras, file = "Figure_source_data/SD_Fig_2B.tiff")
+writeRaster(approxras_bra, file = "Figure_source_data/SD_Fig_2E.tiff")
+
 
 # residuals
 map_resids2 <- tm_shape(admin0, bbox = extent(approxras)) +
@@ -303,6 +320,10 @@ map_resids2_bra <- tm_shape(admin0, bbox = extent(approxras_bra)) +
 
 tmap_save(map_resids2, filename = "Plots/Jan24/Mex_contemporary_residuals_smooth.png")
 tmap_save(map_resids2_bra, filename = "Plots/Jan24/Bra_contemporary_residuals_smooth.png")
+
+# save source data
+writeRaster(approxras_resid, file = "Figure_source_data/SD_Fig_2C.tiff")
+writeRaster(approxras_resid_bra, file = "Figure_source_data/SD_Fig_2F.tiff")
 
 
 

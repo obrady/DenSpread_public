@@ -112,6 +112,9 @@ tmap_save(map_predsB2, filename = "Plots/Jan24/Origins_2.png")
 #tmap_save(map_predsD2, filename = "Plots/Origins_4.pdf")
 #tmap_save(map_predsObserved, filename = "Plots/Jan24/Origins_Observed.png")
 
+# save source data
+write.csv(as.data.frame(admin2)[, c("NAME", "GAUL_CODE", "YPB2")], 
+          file = "Figure_source_data/SD_Fig_6C.csv")
 
 
 
@@ -204,3 +207,7 @@ p1 <- ggplot(comp_df, aes(fill=Type, y=Count, x=Source)) +
   guides(fill=guide_legend(title=""))
 
 ggsave(p1, filename = "Plots/Jan24/Source_metrics.png", width = 6, height = 4)
+
+# source data
+write.csv(comp_df, "Figure_source_data/SD_Fig_6B.csv")
+

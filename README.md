@@ -4,7 +4,7 @@ This repository contains data, code and results from the paper. Users looking to
 
 
 ## System requirements
-This code was developed and implemented using R version 4.0.1 and RStudio version 2022.12.0 using macOS version 14.3.1 (Sonoma). This code requires only a standard computer with enough RAM to support the scale of analysis needed. Once R, RStudio and relevant R packages have been installed, no further installation operations are required.
+This code was developed and implemented using R version 4.0.1 and RStudio version 2022.12.0 using macOS version 14.3.1 (Sonoma). This code requires only a standard computer with enough RAM to support the scale of analysis needed. Once R, RStudio and relevant R packages have been installed, no further installation operations are required. The followign packages are used: geosphere (v1.5-18), spdep (v1.2-7), tidyverse (v1.3.0), Hmisc (v4.7-2), tmap (v3.3), tidymodels (v0.1.0), flexsurv (v2.2.0), SHAPforxgboost (v0.1.0).
 
 
 ## Instructions for use

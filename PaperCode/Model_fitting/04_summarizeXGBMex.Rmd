@@ -393,6 +393,10 @@ shap.plot.summary <- function(data_long, x_bound = NULL, dilute = FALSE, scienti
   return(plot1)
 }
 
+# save source data
+write.csv(shap_long[, c("variable", "value", "stdfvalue")], 
+          file = "/Users/eideobra/Dropbox/08_Serotype_spread/Figure_source_data/SD_Fig_3A.csv")
+
 shap.plot.summary(shap_long)
 ```
 
@@ -433,6 +437,9 @@ table(shapByInvadedGAUL$Driver_Shap)
 # Get GAUL codes 
 shapByInvadedGAULSpatial <- sp::merge(admin2, shapByInvadedGAUL, by.x="GAUL_CODE", by.y="GAUL", all.x=TRUE)
 
+# save source data
+write.csv(shapByInvadedGAUL, file = "/Users/eideobra/Dropbox/08_Serotype_spread/Figure_source_data/SD_Fig_3C.csv")
+
 tm_shape(shapByInvadedGAULSpatial) +
 tm_polygons(border.col = "black")+
 tm_shape(shapByInvadedGAULSpatial) +
@@ -453,6 +460,9 @@ timeShap <- data.frame(Subject = rownames(timeShap),
 timeShap <- reshape(timeShap, idvar = "Subject", varying = list(2:22), v.names = "X", direction = "long")
 # fix years
 timeShap$time = timeShap$time - 1 + min(shapByInvadedGAUL$Year_end)
+
+# save source data
+write.csv(timeShap, file = "/Users/eideobra/Dropbox/08_Serotype_spread/Figure_source_data/SD_Fig_3B.csv")
 
 
 # plotting code
